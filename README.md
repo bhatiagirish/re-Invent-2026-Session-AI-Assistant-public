@@ -15,7 +15,7 @@ session data. The app never invents sessions and keeps no fake local favorites.
 ## Live demo
 
 Try the interface in your browser, with no sign-in and no AWS account:
-**[Open the live demo](https://d1m09v5dappo02.cloudfront.net/demo/index.html)**
+**[Open the live demo](https://bhatiagirish.github.io/re-Invent-2026-Session-AI-Assistant-public/demo/index.html)**
 
 The demo runs the real front-end code against about twenty **fictional**
 sample sessions, so you can click through search, details, favorites,
