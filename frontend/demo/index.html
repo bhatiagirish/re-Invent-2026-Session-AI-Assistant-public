@@ -156,8 +156,13 @@
         <button id="schedule-add-btn" class="btn btn-primary" type="button">
           Add personal time
         </button>
+        <button id="schedule-export-btn" class="btn btn-ghost" type="button"
+                aria-expanded="false" aria-controls="schedule-export-slot" disabled>
+          Add to calendar
+        </button>
       </div>
       <div id="schedule-form-slot" class="schedule-form-slot" hidden></div>
+      <div id="schedule-export-slot" class="schedule-form-slot schedule-export-slot" hidden></div>
       <div id="schedule-content"></div>
     </div>
   </div>
@@ -174,6 +179,7 @@
   <script src="../reservations.js"></script>
   <script src="../schedule.js"></script>
   <script src="../personal-time-form.js"></script>
+  <script src="../calendar.js"></script>
   <script src="../schedule-view.js"></script>
   <script src="../chat.js"></script>
   <script src="../catalog.js"></script>

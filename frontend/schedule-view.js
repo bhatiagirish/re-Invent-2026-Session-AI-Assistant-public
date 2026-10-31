@@ -29,7 +29,39 @@
       content: el("schedule-content"),
       addBtn: el("schedule-add-btn"),
       formSlot: el("schedule-form-slot"),
+      exportBtn: el("schedule-export-btn"),
+      exportSlot: el("schedule-export-slot"),
     };
+  }
+
+  // ── "Add to calendar" (.ics export, frontend/calendar.js) ──────────────────
+  // The export uses the schedule the dialog last loaded successfully, so it
+  // needs no second request. It is unavailable while nothing (or only an error)
+  // is shown.
+  let loadedSchedule = null;
+
+  function setLoadedSchedule(data) {
+    loadedSchedule = data || null;
+    const e = els();
+    if (e.exportBtn) e.exportBtn.disabled = !loadedSchedule;
+  }
+
+  function hideExport() {
+    const e = els();
+    if (e.exportSlot) { e.exportSlot.hidden = true; e.exportSlot.innerHTML = ""; }
+    if (e.exportBtn) e.exportBtn.setAttribute("aria-expanded", "false");
+  }
+
+  function openExport() {
+    const e = els();
+    if (!e.exportSlot || !loadedSchedule || !window.Calendar ||
+        typeof window.Calendar.openPanel !== "function") {
+      return;
+    }
+    if (!e.exportSlot.hidden) { hideExport(); return; }     // the button toggles
+    e.exportSlot.hidden = false;
+    if (e.exportBtn) e.exportBtn.setAttribute("aria-expanded", "true");
+    window.Calendar.openPanel(e.exportSlot, { data: loadedSchedule, onClose: hideExport });
   }
 
   // Show/hide the persistent control based on authorization. Called by app.js
@@ -66,6 +98,7 @@
     const e = els();
     if (e.backdrop) e.backdrop.hidden = true;
     hideForm();
+    hideExport();
   }
 
   // Fetch GET /schedule and render it. On any failure render the error state via
@@ -137,6 +170,10 @@
     if (!window.Schedule || typeof window.Schedule.renderScheduleView !== "function") {
       return;
     }
+    // An open export panel would hold the previous schedule; close it, and
+    // disable export until this load succeeds.
+    hideExport();
+    setLoadedSchedule(null);
     if (!(opts && opts.skipIndexWait)) await waitForIndex();
     showLoading();
     let lastErr = null;
@@ -150,6 +187,7 @@
         const degraded = data && typeof data.message === "string" && data.message;
         if (!degraded) {
           renderInto(window.Schedule.renderScheduleView(data || {}, { onRetry: refresh }));
+          setLoadedSchedule(data || {});
           return;
         }
         lastData = data;
@@ -324,6 +362,11 @@
     if (e.openBtn) e.openBtn.addEventListener("click", open);
     if (e.closeBtn) e.closeBtn.addEventListener("click", closeView);
     if (e.addBtn) e.addBtn.addEventListener("click", () => openForm("add", null));
+    // "Add to calendar" stays disabled until a schedule has loaded.
+    if (e.exportBtn) {
+      e.exportBtn.disabled = !loadedSchedule;
+      e.exportBtn.addEventListener("click", openExport);
+    }
     // Delegate from document so Edit/Delete work on personal-time cards whether
     // they are shown in the modal or inline in the chat conversation.
     document.addEventListener("click", onPersonalTimeClick);
@@ -349,5 +392,7 @@
     // Exposed for the add/edit controls and unit tests (10.3 / 10.6).
     openForm,
     hideForm,
+    openExport,
+    hideExport,
   };
 })();

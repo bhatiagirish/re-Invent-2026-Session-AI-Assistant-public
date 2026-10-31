@@ -86,6 +86,88 @@
     }
   }
 
+  // ── Pacific -> UTC for sessions ─────────────────────────────────────────────
+  // Sessions arrive as Pacific event-local "YYYY-MM-DD" + "HH:MM". Convert them
+  // with the real IANA rule through Intl. (Never Date.parse: it reads the
+  // BROWSER's time zone, so sessions sorted wrongly against personal time
+  // outside Pacific, and Safari cannot parse "YYYY-MM-DD HH:MM" at all, which
+  // pushed every session to the end of the list.)
+  var pacificPartsFmt = null;
+  function pacificParts(ms) {
+    if (!pacificPartsFmt) {
+      pacificPartsFmt = new Intl.DateTimeFormat("en-US", {
+        timeZone: EVENT_TZ, hourCycle: "h23",
+        year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", second: "2-digit",
+      });
+    }
+    var out = {};
+    pacificPartsFmt.formatToParts(new Date(ms)).forEach(function (p) {
+      if (p.type !== "literal") out[p.type] = parseInt(p.value, 10);
+    });
+    if (out.hour === 24) out.hour = 0;
+    return out;
+  }
+
+  // Minutes Pacific is BEHIND UTC at a given instant (480 in PST, 420 in PDT).
+  function pacificOffsetMinutes(ms) {
+    try {
+      var p = pacificParts(ms);
+      var asUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+      return Math.round((Math.floor(ms / 1000) * 1000 - asUtc) / 60000);
+    } catch (_) {
+      return 480;   // no Intl time zones: re:Invent week is PST (UTC-8)
+    }
+  }
+
+  // Pacific "YYYY-MM-DD" + "HH:MM" -> UTC epoch milliseconds, or null.
+  function pacificToUtcMs(date, time) {
+    var d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ""));
+    var t = /^(\d{1,2}):(\d{2})/.exec(String(time || ""));
+    if (!d || !t) return null;
+    var guess = Date.UTC(+d[1], +d[2] - 1, +d[3], +t[1], +t[2]);
+    var first = guess + pacificOffsetMinutes(guess) * 60000;
+    return guess + pacificOffsetMinutes(first) * 60000;
+  }
+
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+
+  // The Pacific calendar day ("YYYY-MM-DD") of a UTC instant.
+  function pacificDateKey(ms) {
+    try {
+      var p = pacificParts(ms);
+      return p.year + "-" + pad2(p.month) + "-" + pad2(p.day);
+    } catch (_) {
+      var d = new Date(ms - 480 * 60000);
+      return d.getUTCFullYear() + "-" + pad2(d.getUTCMonth() + 1) + "-" + pad2(d.getUTCDate());
+    }
+  }
+
+  // Start / end of a session as UTC epoch ms (null when not known).
+  function sessionStartMs(s) {
+    var t = (s && s.sessionTime) || {};
+    return pacificToUtcMs(t.date, t.time);
+  }
+
+  function sessionEndMs(s) {
+    var start = sessionStartMs(s);
+    var len = Number(((s && s.sessionTime) || {}).length);
+    return start != null && len > 0 ? start + len * 60000 : null;
+  }
+
+  // "Tuesday, Dec 1" for a "YYYY-MM-DD" day key.
+  function fmtDayHeading(key) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(key || ""));
+    if (!m) return String(key || "");
+    try {
+      return new Intl.DateTimeFormat("en-US", {
+        timeZone: "UTC", weekday: "long", month: "short", day: "numeric",
+      }).format(new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], 12)));
+    } catch (_) {
+      return key;
+    }
+  }
+
   // Build the "when" line for a personal-time entry (UTC contract -> Pacific).
   function personalWhen(p) {
     var start = parseUtcContract(p.start);
@@ -118,11 +200,7 @@
       var d = parseUtcContract(item.data.start);
       return d ? d.getTime() : null;
     }
-    // Sessions carry display date/time strings; Date.parse is best-effort.
-    var t = item.data.sessionTime || {};
-    var raw = [t.date, t.time].filter(Boolean).join(" ");
-    var sd = raw ? Date.parse(raw) : NaN;
-    return isNaN(sd) ? null : sd;
+    return sessionStartMs(item.data);
   }
 
   function endKey(item) {
@@ -130,7 +208,52 @@
       var d = parseUtcContract(item.data.end);
       return d ? d.getTime() : null;
     }
-    return null;
+    return sessionEndMs(item.data);
+  }
+
+  // The Pacific day an item belongs to ("YYYY-MM-DD"), or null when unknown.
+  function itemDayKey(item) {
+    if (item.kind === "personal") {
+      var d = parseUtcContract(item.data.start);
+      return d ? pacificDateKey(d.getTime()) : null;
+    }
+    var t = item.data.sessionTime || {};
+    return /^\d{4}-\d{2}-\d{2}$/.test(t.date || "") ? t.date : null;
+  }
+
+  // All schedule items, tagged with exactly one kind and in display order.
+  function scheduleItems(data) {
+    data = data || {};
+    var items = [];
+    (Array.isArray(data.reserved) ? data.reserved : []).forEach(function (s) {
+      items.push({ kind: "reserved", data: s });
+    });
+    (Array.isArray(data.favorites) ? data.favorites : []).forEach(function (s) {
+      items.push({ kind: "favorite", data: s });
+    });
+    (Array.isArray(data.personalTime) ? data.personalTime : []).forEach(function (p) {
+      items.push({ kind: "personal", data: p });
+    });
+    items.sort(compareItems);
+    return items;
+  }
+
+  // Group ordered items by Pacific day: days in calendar order, then one group
+  // for items whose day is unknown. Order inside a day is kept.
+  function groupByDay(items) {
+    var byKey = {};
+    var keys = [];
+    var undated = [];
+    items.forEach(function (item) {
+      var k = itemDayKey(item);
+      if (!k) { undated.push(item); return; }
+      if (!byKey[k]) { byKey[k] = []; keys.push(k); }
+      byKey[k].push(item);
+    });
+    keys.sort();
+    var groups = keys.map(function (k) { return { key: k, items: byKey[k] }; });
+    if (undated.length) groups.push({ key: null, items: undated });
+    return groups;
   }
 
   function titleKey(item) {
@@ -411,16 +534,17 @@
       wrap.appendChild(src);
     }
 
-    // Tag each item with exactly one kind, then merge + order chronologically.
-    var items = [];
-    reserved.forEach(function (s) { items.push({ kind: "reserved", data: s }); });
-    favorites.forEach(function (s) { items.push({ kind: "favorite", data: s }); });
-    personal.forEach(function (p) { items.push({ kind: "personal", data: p }); });
-    items.sort(compareItems);
-
+    // Tag each item with exactly one kind, order chronologically, and show each
+    // Pacific day under its own heading ("Tuesday, Dec 1").
     var list = document.createElement("div");
     list.className = "session-list schedule-list";
-    items.forEach(function (item) { list.appendChild(renderItem(item)); });
+    groupByDay(scheduleItems(data)).forEach(function (group) {
+      var heading = document.createElement("h3");
+      heading.className = "schedule-day-heading";
+      heading.textContent = group.key ? fmtDayHeading(group.key) : "Time not set";
+      list.appendChild(heading);
+      group.items.forEach(function (item) { list.appendChild(renderItem(item)); });
+    });
     wrap.appendChild(list);
     return wrap;
   }
@@ -431,5 +555,14 @@
     fmtPacific: fmtPacific,
     parseUtcContract: parseUtcContract,
     toPacificLocalInput: toPacificLocalInput,
+    // Used by calendar.js (the .ics export) and unit tests.
+    pacificToUtcMs: pacificToUtcMs,
+    pacificDateKey: pacificDateKey,
+    sessionStartMs: sessionStartMs,
+    sessionEndMs: sessionEndMs,
+    itemDayKey: itemDayKey,
+    fmtDayHeading: fmtDayHeading,
+    scheduleItems: scheduleItems,
+    groupByDay: groupByDay,
   };
 })();

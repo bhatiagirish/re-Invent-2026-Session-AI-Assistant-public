@@ -22,7 +22,8 @@ Try the interface in your browser, with no sign-in and no AWS account:
 
 The demo runs the real front-end code against about twenty **fictional**
 sample sessions, so you can click through search, details, favorites,
-reservations, the schedule view and personal time. A few things to know:
+reservations, the schedule view, personal time and the calendar export. A few
+things to know:
 
 - It uses a simple keyword matcher instead of the AI agent, so it understands
   far fewer phrasings than the real app, which uses Amazon Bedrock and live data
@@ -47,7 +48,8 @@ Ask in plain language, or use the buttons on each session card.
 | Count and group | "How many sessions about Kiro are on Dec 3?", "Count workshops by venue" |
 | Favorites | "Favorite #2", "Unfavorite it", "Show my favorites" (star button on cards) |
 | Reservations | "Reserve #3", "Cancel that reservation" (Reserve button on cards, "My Reservations" view) |
-| Schedule | "Show my schedule" (reserved sessions, favorites and personal time in one ordered list, Pacific time) |
+| Schedule | "Show my schedule" (reserved sessions, favorites and personal time in one ordered list, grouped by day, Pacific time) |
+| Add to calendar | **Add to calendar** in My Schedule downloads an `.ics` file for one day or the whole week (see below) |
 | Personal time | "Add lunch Dec 1 noon to 1pm", "Move my 3pm block to 4pm", "Delete that block" (also a form in the schedule view) |
 | Follow-ups | "How many of those are workshops?" (the assistant remembers earlier turns) |
 
@@ -56,6 +58,21 @@ Other frontend features:
 - Responses can contain Markdown, rendered safely (no raw HTML injection).
 - A favorite is a bookmark. A reservation is a held seat. The app keeps the two
   distinct and only reports success when AWS Events confirms it.
+
+### Add to calendar
+
+**My Schedule → Add to calendar** saves your schedule as an `.ics` file you can
+open in Apple Calendar, Google Calendar or Outlook.
+
+- Reserved sessions and personal time are included. Favorites are optional and
+  come in as tentative, so they don't block your time.
+- Choose one day or all five, and an optional 15-minute reminder.
+- Times are written in UTC, so they show correctly in your calendar's time zone.
+- Each event has a stable ID, so importing again is meant to update events
+  rather than duplicate them (calendar apps differ here).
+- The file is built in your browser from the schedule already on screen; no
+  extra request is made. Sessions that couldn't be loaded are named in a warning
+  rather than left out silently.
 
 ## How it works
 
@@ -368,3 +385,6 @@ by AWS design, at a cost of cents.
   schedule retries automatically; if it still fails, use **Try again**.
 - The app never fabricates sessions: a session AWS Events cannot return is left
   out and reported (for example, "Showing 68 of 70 favorites").
+- The calendar export is a one-time snapshot, not a subscription. If a session
+  moves, download and import again. If you cancel a seat, delete that event in
+  your calendar yourself; a new file can't remove it.

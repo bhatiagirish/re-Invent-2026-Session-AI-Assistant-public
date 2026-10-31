@@ -319,7 +319,21 @@ body {
 .btn-danger:disabled, .btn:disabled { opacity: .6; cursor: not-allowed; }
 
 /* Toolbar above the schedule list — the always-available "Add personal time". */
-.schedule-toolbar { display: flex; justify-content: flex-end; margin: 0 0 12px; }
+.schedule-toolbar { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
+
+/* Day headings that group the schedule list by Pacific day. */
+.schedule-day-heading {
+  margin: 8px 0 0; padding-bottom: 4px; font-size: .95rem; font-weight: 700;
+  color: var(--brand); border-bottom: 1px solid var(--line);
+}
+.schedule-day-heading:first-child { margin-top: 0; }
+
+/* "Add to calendar" panel (rendered into #schedule-export-slot). */
+.calendar-intro { margin: 0; font-size: .88rem; color: var(--ink-soft); }
+.calendar-check { flex-direction: row; align-items: center; gap: 8px; }
+.calendar-check input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+.calendar-check .pt-label { font-weight: 500; }
+.calendar-summary { margin: 0; font-size: .88rem; color: var(--ink); }
 
 /* The add/edit form renders into this slot above the list; hidden until opened. */
 .schedule-form-slot {
@@ -462,6 +476,15 @@ textarea.pt-input { min-height: 64px; resize: vertical; }
 [data-theme="dark"] .kind-badge.kind-reserved { background: rgba(80,150,255,.16); color: #8db6ff; border-color: #35507e; }
 [data-theme="dark"] .kind-badge.kind-favorite { background: rgba(255,140,43,.16); color: var(--accent); border-color: #7a4a1e; }
 [data-theme="dark"] .kind-badge.kind-personal { background: rgba(26,147,111,.18); color: #58d0a6; border-color: #2b6b53; }
+
+/* Schedule dialog: headings use --brand (near-black in dark), and the form
+   slot / inputs had light-only backgrounds under light dark-theme text. */
+[data-theme="dark"] .schedule-heading,
+[data-theme="dark"] .schedule-day-heading,
+[data-theme="dark"] .pt-form-title { color: var(--ink); }
+[data-theme="dark"] .schedule-form-slot { background: #0f1d33; border-color: var(--line); }
+[data-theme="dark"] .pt-input { background: #0b1526; color: var(--ink); border-color: var(--line); }
+[data-theme="dark"] .schedule-state { background: #0f1d33; border-color: var(--line); }
 
 /* The theme toggle button itself (shared light+dark styling kept minimal). */
 .theme-toggle {
