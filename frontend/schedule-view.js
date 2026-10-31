@@ -214,6 +214,32 @@
       { error: true, message, onRetry: refresh }));
   }
 
+  // A reservation or favorite was changed from a card while the dialog is open
+  // (Cancel reservation, Reserve or Favorite on a schedule card). Removing just
+  // the card left its day heading behind and, worse, left the loaded schedule
+  // that "Add to calendar" exports out of date (a cancelled seat was still
+  // exported). Reload so the list, headings and export data match AWS Events.
+  // Changes made while a reload is running trigger one more reload afterwards,
+  // so the last change always wins.
+  let changeReload = null;
+  let changePending = false;
+  function onScheduleChanged() {
+    const e = els();
+    if (!e.backdrop || e.backdrop.hidden) return Promise.resolve();
+    if (changeReload) { changePending = true; return changeReload; }
+    changeReload = (async () => {
+      try {
+        do {
+          changePending = false;
+          await refresh({ skipIndexWait: true });
+        } while (changePending && !e.backdrop.hidden);
+      } finally {
+        changeReload = null;
+      }
+    })();
+    return changeReload;
+  }
+
   // Open the Schedule_View. Guarded by authorization so it never surfaces MCP
   // state for an unauthorized session.
   async function open() {
@@ -394,5 +420,6 @@
     hideForm,
     openExport,
     hideExport,
+    onScheduleChanged,
   };
 })();

@@ -174,6 +174,11 @@
         // In the Schedule_View, drop the reserved card on cancel.
         if (!nowReserved && card && card.dataset &&
             card.dataset.view === "reserved") card.remove();
+        // If My Schedule is open, reload it so day headings and the data
+        // "Add to calendar" exports reflect the change (no-op when closed).
+        if (window.ScheduleView && typeof window.ScheduleView.onScheduleChanged === "function") {
+          window.ScheduleView.onScheduleChanged();
+        }
       } else {
         // Leave the card unchanged; show a SPECIFIC, friendly reason (full /
         // clash / unconfirmed / busy) from the backend action, not a generic

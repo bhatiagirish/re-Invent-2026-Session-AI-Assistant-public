@@ -18,6 +18,11 @@
           ? "✓ Added to your favorites." : "Removed from your favorites.");
         // If we're in the favorites view, remove the card on unfavorite.
         if (!nowFav && card && card.dataset.view === "favorites") card.remove();
+        // If My Schedule is open, reload it so it and the data "Add to
+        // calendar" exports reflect the change (no-op when closed).
+        if (window.ScheduleView && typeof window.ScheduleView.onScheduleChanged === "function") {
+          window.ScheduleView.onScheduleChanged();
+        }
       } else {
         setButtonState(btn, currentlyFav);
         if (window.Chat) window.Chat.notify(
