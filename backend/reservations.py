@@ -22,7 +22,8 @@ from typing import Optional
 import logging
 
 from errors import McpError
-from favorites import _failed_ids, _failure_reason, resolve_sessions_with_total
+from favorites import (_failed_ids, _failure_reason, extract_session_ids,
+                       resolve_sessions_with_total)
 from mcp_client import EventsClient
 from models import ActionResult, Session
 
@@ -177,20 +178,10 @@ def get_reserved_ids(events: EventsClient) -> list[str]:
     schedule = events.get_schedule()
     if not isinstance(schedule, dict):
         return []
-    reserved = schedule.get("reserved")
-    if not isinstance(reserved, list):
-        return []
-    ids: list[str] = []
-    seen: set[str] = set()
-    for entry in reserved:
-        if not isinstance(entry, str):
-            continue
-        sid = entry.strip()
-        if not sid or sid in seen:
-            continue
-        seen.add(sid)
-        ids.append(sid)
-    return ids
+    # Accept plain id strings AND objects carrying the id (see
+    # favorites.extract_session_ids). Previously only strings were kept, which
+    # dropped every object entry and made the reserved count read 0.
+    return extract_session_ids(schedule.get("reserved"))
 
 
 def get_reserved_sessions_with_total(events: EventsClient,

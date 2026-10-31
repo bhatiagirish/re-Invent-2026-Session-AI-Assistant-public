@@ -22,6 +22,8 @@ The agent still performs genuine agentic tool selection from natural language
 from __future__ import annotations
 
 import concurrent.futures
+import re
+import time
 from typing import Optional
 
 import config
@@ -120,7 +122,14 @@ field left empty is cleared.
 - delete_personal_time(reference): remove a personal-time block by its id or an \
 ordinal reference like "#2". Deletion is idempotent, so a block that is already \
 gone still reports success.
-
+- find_session_by_code(code): find ONE session by its exact session code (e.g. \
+"IND422"). search_sessions only scans the first part of the catalog, so when the \
+user names a specific session code that is NOT in a list you already showed, \
+call find_session_by_code BEFORE saying a session cannot be found. Only say a \
+session does not exist if this tool reports NOT_FOUND after checking the whole \
+catalog; if it reports SEARCH_INCOMPLETE, say the lookup did not finish and \
+offer to retry.
+<<RESERVATION_TOOLS>>
 Rules:
 - NEVER fabricate or guess session information. Session IDs, codes, titles, \
 speakers, dates, times, venues, rooms, levels, and availability must come only \
@@ -130,9 +139,9 @@ session", "the previous session", "that workshop", or "the Bedrock session you \
 showed me". If a reference is ambiguous or out of range, ask a brief clarifying \
 question instead of guessing.
 - You CAN favorite sessions and show the user's favorites using the favorite \
-tools. Favoriting and RESERVING a session are different operations: never claim \
-the user has reserved a seat, and never offer to reserve (reservation is out of \
-scope). Only confirm a favorite/unfavorite AFTER the tool reports success.
+tools. Favoriting and RESERVING a session are different operations: a favorite \
+is a bookmark and a reservation is a held seat; never relabel one as the other. \
+Only confirm a favorite/unfavorite AFTER the tool reports success.
 - You CAN view the user's schedule and create, update, and delete their \
 personal-time blocks using the schedule and personal-time tools. When you \
 present the schedule, label every item by its kind — a reserved session, a \
@@ -141,15 +150,62 @@ favorite, or a personal-time block — and never relabel one kind as another \
 seat). Personal-time start/end are Pacific event-local; only confirm a \
 create/update/delete AFTER the tool reports success, and if validation fails \
 report the specific problem the tool names.
-- Reservation is currently unavailable. Do NOT offer to reserve a seat, do NOT \
-claim any session is reserved, and present the reserved-sessions list only from \
-real schedule data (it is empty until the reservation capability is used).
+<<RESERVATION_RULES>>
 - Keep answers concise and useful. When you list sessions, refer to them by \
 their position (1, 2, 3, ...) and session code so the user can follow up.
 - If a tool returns no matching sessions, say so plainly and suggest a broader \
 topic. If a tool fails, tell the user you could not retrieve the information \
 right now; do not answer from your own knowledge.
 """
+
+
+# The reservation wording depends on config.RESERVATIONS_ENABLED. The prompt used
+# to be a single static string that ALWAYS said "Reservation is currently
+# unavailable", so even with the flag on (and reserve/cancel tools attached) the
+# model was told never to offer a reservation or claim a session was reserved --
+# which made "show my reservations" / "how many reservations" answer wrongly.
+_RESERVATION_TOOLS_ON = (
+    "- show_reservations(): list the user's reserved sessions (held seats) from "
+    "AWS Events. They are rendered to the user as cards; summarize the count "
+    "and, if the tool says only some are shown, say so.\n"
+    "- reserve_session(reference): reserve a seat for ONE session, identified by "
+    "session code or a reference like \"#2\". Only say a seat was reserved AFTER "
+    "the tool reports RESERVED (or ALREADY_RESERVED). If it reports SESSION_FULL, "
+    "SCHEDULE_CONFLICT, NOT_RESERVABLE (walk-up only) or RESERVE_UNCONFIRMED, say "
+    "so plainly and do NOT claim a seat.\n"
+    "- cancel_reservation(reference): cancel the user's reservation for ONE "
+    "session. Only say it was cancelled AFTER the tool reports success.\n"
+)
+_RESERVATION_RULES_ON = (
+    "- You CAN reserve and cancel seats and list the user's reserved sessions "
+    "using the reservation tools. A reservation (a held seat) is NOT a favorite "
+    "(a bookmark); never relabel one as the other. For \"how many reservations / "
+    "seats do I have\" call count_sessions(scope=\"reserved\") in THIS turn, and "
+    "for \"show my reservations\" call show_reservations in THIS turn; never "
+    "answer from memory or from the schedule cards. If the tool reports that "
+    "AWS Events lists N reserved seats but their details could not be loaded, "
+    "state N honestly and say the details are unavailable; never say the user "
+    "has no reservations in that case."
+)
+_RESERVATION_RULES_OFF = (
+    "- Reservation is currently unavailable. Do NOT offer to reserve a seat, do "
+    "NOT claim any session is reserved, and present the reserved-sessions list "
+    "only from real schedule data (it is empty until the reservation capability "
+    "is used)."
+)
+
+
+def build_system_prompt(reservations_enabled: Optional[bool] = None) -> str:
+    """Return SYSTEM_PROMPT with the reservation wording matched to the flag, so
+    the prompt never contradicts the tools the agent actually has."""
+    if reservations_enabled is None:
+        reservations_enabled = config.RESERVATIONS_ENABLED
+    # The trailing "\n" keeps a blank line before "Rules:" in both variants.
+    tools = (_RESERVATION_TOOLS_ON if reservations_enabled else "") + "\n"
+    rules = _RESERVATION_RULES_ON if reservations_enabled else _RESERVATION_RULES_OFF
+    return (SYSTEM_PROMPT
+            .replace("<<RESERVATION_TOOLS>>\n", tools)
+            .replace("<<RESERVATION_RULES>>", rules))
 
 
 class SessionRecorder:
@@ -282,6 +338,198 @@ def _show_favorites_impl(events: EventsClient, recorder: SessionRecorder) -> str
                 f"session(s). Tell the user these are the first {shown} of their "
                 f"{total} favorites (not all of them), then list them.\n{summary}")
     return (f"ALL_FAVORITES: showing all {total} favorite session(s).\n{summary}")
+
+
+def _show_reservations_impl(events: EventsClient, recorder: SessionRecorder) -> str:
+    """List the user's reserved sessions. Mirrors _show_favorites_impl, with one
+    extra guard: GetSchedule can list reserved ids whose GetSession detail
+    cannot be fetched. The id count is the TRUE total, so in that case we still
+    report it (instead of "no reservations")."""
+    sessions, total = resv.get_reserved_sessions_with_total(events)
+    recorder.record("show_reservations", sessions)
+    if total == 0:
+        return "NO_RESERVATIONS: the user has no reserved seats."
+    shown = len(sessions)
+    if shown == 0:
+        return (f"RESERVATIONS_UNRESOLVED: AWS Events lists {total} reserved "
+                f"seat(s) for the user, but the session details could not be "
+                f"loaded right now. Tell the user they have {total} reserved "
+                f"seat(s) and that the details are unavailable. Do NOT say they "
+                f"have no reservations.")
+    summary = _summarize_for_model(sessions)
+    if shown < total:
+        return (f"PARTIAL_RESERVATIONS: AWS Events lists {total} reserved "
+                f"seat(s); details are available for {shown}. Tell the user they "
+                f"have {total} reserved seat(s) and that only {shown} could be "
+                f"shown, then list those.\n{summary}")
+    return f"ALL_RESERVATIONS: showing all {total} reserved session(s).\n{summary}"
+
+
+# ---------------------------------------------------------------------------
+# Session-code lookup (find one session by its code, anywhere in the catalog)
+# ---------------------------------------------------------------------------
+#
+# ListSessions can only be paged (250 per page, ~10 pages); it has no filter.
+# search_sessions deliberately reads only MAX_LIST_PAGES pages, so a session on
+# a later page (e.g. IND422 was on page 8) is invisible to it. Looking up a
+# specific CODE therefore walks the catalog until the code is found, bounded by
+# a page cap and a time budget. Every session seen along the way is remembered
+# in a small in-memory index (reused while the Lambda container is warm), so
+# repeat lookups are instant. The catalog is public event data, not per-user.
+_CODE_RE = re.compile(r"^[A-Za-z]{2,4}\d{2,4}(?:-[A-Za-z0-9]+)?$")
+_CODE_INDEX: dict[str, tuple[float, Session]] = {}
+
+
+def _norm_code(code: Optional[str]) -> str:
+    return (code or "").strip().upper()
+
+
+def _looks_like_code(reference: Optional[str]) -> bool:
+    """True for a bare session code such as IND422 or AIM336-R1. Real session
+    ids (e.g. 1780441461150001GGoc) start with digits and do not match."""
+    return bool(reference and _CODE_RE.match(reference.strip()))
+
+
+def _index_put(session: Session) -> None:
+    code = _norm_code(session.abbreviation)
+    if code:
+        _CODE_INDEX[code] = (time.time(), session)
+
+
+def _index_lookup(want: str) -> list[Session]:
+    """Fresh index entries for `want`: the exact code if known, otherwise its
+    suffixed variants (IND422 -> IND422-R, IND422-S)."""
+    cutoff = time.time() - config.CODE_INDEX_TTL_SECONDS
+    exact = _CODE_INDEX.get(want)
+    if exact and exact[0] >= cutoff:
+        return [exact[1]]
+    return [s for code, (ts, s) in sorted(_CODE_INDEX.items())
+            if code.startswith(want + "-") and ts >= cutoff]
+
+
+def _lookup_sessions_by_code(events: EventsClient, code: str
+                             ) -> tuple[list[Session], bool]:
+    """Find the session(s) whose code is `code`, walking the catalog if needed.
+
+    Returns (matches, searched_all). `searched_all` is True when the answer is
+    definitive: a match was found, or every page was read. It is False when the
+    walk stopped early (page cap or time budget), so "not found" would be a
+    guess and the caller must say the lookup was incomplete.
+    """
+    want = _norm_code(code)
+    if not want:
+        return [], True
+    cached = _index_lookup(want)
+    if cached:
+        return cached, True
+
+    # Progress of the catalog walk is remembered between attempts, so a walk
+    # that ran out of time is RESUMED (from the saved nextToken) instead of
+    # restarting at page 1. Once the walk has reached the last page, the index
+    # holds the whole catalog and an absent code is definitively absent.
+    if not _walk_is_fresh():
+        _walk_reset()
+    elif _CODE_WALK["complete"]:
+        return [], True
+
+    found: list[Session] = []
+
+    def on_page(page: list[Session]) -> bool:
+        exact: list[Session] = []
+        variants: list[Session] = []
+        for s in page:
+            _index_put(s)
+            c = _norm_code(s.abbreviation)
+            if c == want:
+                exact.append(s)
+            elif c.startswith(want + "-"):
+                variants.append(s)
+        found.extend(exact or variants)
+        return bool(found)
+
+    start_token = _CODE_WALK["token"]
+    try:
+        pages, token, stopped = _walk_pages(events, on_page, start_token)
+    except McpError:
+        if not start_token:
+            raise
+        # The saved resume token was rejected: restart once from page 1.
+        _walk_reset()
+        found.clear()
+        pages, token, stopped = _walk_pages(events, on_page, None)
+
+    if not _CODE_WALK["ts"]:
+        _CODE_WALK["ts"] = time.time()
+    _CODE_WALK["pages"] += pages
+    _CODE_WALK["token"] = token
+    if stopped == "end" or (stopped == "found" and not token):
+        _CODE_WALK["complete"] = True
+
+    if found:
+        return found, True
+    return [], stopped == "end"                    # absent only if fully read
+
+
+# Where the last code-lookup walk stopped, so the next attempt resumes there.
+_CODE_WALK: dict = {"token": None, "pages": 0, "complete": False, "ts": 0.0}
+
+
+def _walk_reset() -> None:
+    _CODE_WALK.update(token=None, pages=0, complete=False, ts=0.0)
+
+
+def _walk_is_fresh() -> bool:
+    ts = _CODE_WALK["ts"]
+    return bool(ts) and ts >= time.time() - config.CODE_INDEX_TTL_SECONDS
+
+
+def _walk_pages(events, on_page, next_token):
+    """Walk ListSessions pages, returning ``(pages_read, next_token, stopped)``
+    with `stopped` in found/end/cap/budget. Uses the client's single-connection
+    walk when available (much cheaper: one handshake for all pages); otherwise
+    falls back to one ``list_sessions`` call per page."""
+    walker = getattr(events, "walk_session_pages", None)
+    if walker is not None:
+        return walker(on_page,
+                      max_pages=config.MAX_CODE_LOOKUP_PAGES,
+                      budget_seconds=config.CODE_LOOKUP_BUDGET_SECONDS,
+                      next_token=next_token)
+    deadline = time.monotonic() + config.CODE_LOOKUP_BUDGET_SECONDS
+    pages = 0
+    while True:
+        page, next_token = events.list_sessions(include_abstracts=False,
+                                                next_token=next_token)
+        pages += 1
+        if on_page(page):
+            return pages, next_token, "found"
+        if not next_token:
+            return pages, None, "end"
+        if pages >= config.MAX_CODE_LOOKUP_PAGES:
+            return pages, next_token, "cap"
+        if time.monotonic() > deadline:
+            return pages, next_token, "budget"
+
+
+def _find_by_code_impl(events: EventsClient, recorder: SessionRecorder,
+                       code: str) -> str:
+    matches, searched_all = _lookup_sessions_by_code(events, code)
+    shown = matches[:config.DEFAULT_SESSION_RESULT_LIMIT]
+    recorder.record("find_session_by_code", shown)
+    if shown:
+        extra = ""
+        if len(matches) > len(shown):
+            extra = f" (showing {len(shown)} of {len(matches)} variants)"
+        return f"FOUND: {len(matches)} session(s) with code {code}{extra}.\n" + \
+            _summarize_for_model(shown)
+    if searched_all:
+        return (f"NOT_FOUND: no session with code {code} exists in the "
+                f"re:Invent 2026 catalog (the whole catalog was checked). Tell "
+                f"the user it does not exist and suggest checking the code.")
+    return (f"SEARCH_INCOMPLETE: the lookup for {code} ran out of time before "
+            f"the whole catalog was read, so it is unknown whether it exists. "
+            f"Progress was saved, so asking again continues where it stopped. "
+            f"Tell the user the lookup did not finish and offer to retry. Do NOT "
+            f"say the session does not exist.")
 
 
 # ---------------------------------------------------------------------------
@@ -783,6 +1031,15 @@ def build_agent(events: EventsClient, recorder: SessionRecorder,
         return _show_favorites_impl(events, recorder)
 
     @tool
+    def find_session_by_code(code: str) -> str:
+        """Find ONE re:Invent 2026 session by its exact session code (for
+        example 'IND422' or 'AIM336-R1'). Unlike search_sessions, this checks
+        the WHOLE catalog, so use it whenever the user names a specific session
+        code that was not in a list you already showed. Reports NOT_FOUND only
+        after the whole catalog was checked."""
+        return _find_by_code_impl(events, recorder, code)
+
+    @tool
     def show_schedule(date: str = None) -> str:
         """Show the user's re:Invent 2026 schedule (reserved sessions,
         favorites, and personal-time blocks). Pass `date` as a Pacific
@@ -894,6 +1151,13 @@ def build_agent(events: EventsClient, recorder: SessionRecorder,
         return _reserve_impl(events, recorder, target, session_code=reference)
 
     @tool
+    def show_reservations() -> str:
+        """List the user's reserved sessions (held seats) from AWS Events. Use
+        this for "show my reservations". Reports the TRUE number of reserved
+        seats even if some session details could not be loaded."""
+        return _show_reservations_impl(events, recorder)
+
+    @tool
     def cancel_reservation(reference: str) -> str:
         """Cancel the user's reservation for ONE session via AWS Events.
         `reference` may be a session code, sessionId, or an ordinal like '#2'.
@@ -907,23 +1171,35 @@ def build_agent(events: EventsClient, recorder: SessionRecorder,
             resolved = resolve_reference(reference)
             if resolved:
                 return resolved
+        # A bare session code that was not in the last list shown (so the
+        # conversation context cannot resolve it): look it up in the whole
+        # catalog and use its real sessionId. Without this, details / favorite /
+        # reserve would be sent the CODE as if it were a sessionId.
+        if _looks_like_code(reference):
+            try:
+                found, _ = _lookup_sessions_by_code(events, reference)
+            except (McpError, McpTimeoutError, McpUnavailableError):
+                found = []
+            if found:
+                return found[0].session_id
         return reference
 
     model = BedrockModel(model_id=config.BEDROCK_MODEL_ID,
                          region_name=config.BEDROCK_REGION)
-    tools = [search_sessions, get_session_details,
+    tools = [search_sessions, get_session_details, find_session_by_code,
              favorite_session, unfavorite_session, show_favorites,
              show_schedule, find_schedule_conflicts,
              add_personal_time, update_personal_time,
              delete_personal_time, count_sessions]
     # Reservation tools are exposed ONLY while the phased capability is enabled.
-    # While disabled the agent has no reservation tool at all and the
-    # SYSTEM_PROMPT already tells it reservation is unavailable (Req 21.10, 23.8).
+    # While disabled the agent has no reservation tool at all and the prompt
+    # (build_system_prompt) tells it reservation is unavailable; while enabled the
+    # prompt describes the tools instead (Req 21.10, 23.8).
     if config.RESERVATIONS_ENABLED:
-        tools.extend([reserve_session, cancel_reservation])
+        tools.extend([show_reservations, reserve_session, cancel_reservation])
     agent_kwargs = {
         "model": model,
-        "system_prompt": SYSTEM_PROMPT,
+        "system_prompt": build_system_prompt(),
         "tools": tools,
     }
     if history:

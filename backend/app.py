@@ -707,7 +707,7 @@ def get_reservations(event: dict) -> dict:
     fan-out is capped."""
     sm, app_session_id, _ = _authorized_session_or_raise(event)
     try:
-        sessions, _total = _reserved_sessions_with_retry(sm, app_session_id)
+        sessions, total = _reserved_sessions_with_retry(sm, app_session_id)
     except McpAuthExpired:
         raise AuthRequiredError()
     except McpTimeoutError:
@@ -716,7 +716,19 @@ def get_reservations(event: dict) -> dict:
     except (McpUnavailableError, McpError):
         return _json_response(200, {"sessions": [],
                                     "message": "I couldn't retrieve your reserved sessions right now. Please try again."})
-    return _json_response(200, {"sessions": [s.to_public_dict() for s in sessions]})
+    body = {"sessions": [s.to_public_dict() for s in sessions], "total": total}
+    # Honest totals: `total` is the real number of reserved ids from AWS Events.
+    # When some (or all) of them could not be resolved to session details, say
+    # so instead of letting the UI read an empty list as "no reservations".
+    if total > len(sessions):
+        if sessions:
+            body["message"] = (f"Showing {len(sessions)} of your {total} reserved "
+                               f"sessions; the rest couldn't be loaded right now.")
+        else:
+            body["message"] = (f"You have {total} reserved seat"
+                               f"{'s' if total != 1 else ''}, but their session "
+                               f"details couldn't be loaded right now.")
+    return _json_response(200, body)
 
 
 def get_reserved_ids_route(event: dict) -> dict:

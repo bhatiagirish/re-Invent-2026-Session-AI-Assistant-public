@@ -367,10 +367,17 @@
     }
     const sessions = data.sessions || [];
     if (!sessions.length) {
-      appendMessage("assistant", "You don't have any reserved sessions yet.");
+      // `total` is the true number of reserved seats. An empty list with a
+      // positive total means the details could not be loaded, which is NOT the
+      // same as having no reservations, so say so honestly.
+      appendMessage("assistant", data.total > 0 && data.message
+        ? data.message
+        : "You don't have any reserved sessions yet.");
       return;
     }
-    appendMessage("assistant", "Here are your reserved sessions.");
+    appendMessage("assistant", data.message && data.total > sessions.length
+      ? data.message
+      : "Here are your reserved sessions.");
     const list = window.Sessions.renderSessionList(sessions);
     list.querySelectorAll(".session-card").forEach((c) => (c.dataset.view = "reserved"));
     el("conversation").appendChild(list);

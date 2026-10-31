@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
-from typing import Optional
+import time
+from typing import Callable, Optional
 
 import config
 from errors import (
@@ -229,15 +230,95 @@ class EventsClient:
                 McpUnavailableError, McpTimeoutError):
             raise
         except Exception as exc:
-            if _looks_like_auth_error(exc):
-                raise McpAuthExpired(str(exc)) from exc
-            if _looks_like_access_denied(exc):
-                raise EventAccessDeniedError() from exc
-            text = f"{exc}".lower()
-            if any(t in text for t in ("connection", "timeout", "unavailable", "503")):
-                raise McpUnavailableError() from exc
-            # Preserve the real cause; include a sanitized detail when debugging.
-            raise McpError(_detail(tool_name, exc)) from exc
+            raise self._map_exception(tool_name, exc) from exc
+
+    @staticmethod
+    def _map_exception(tool_name: str, exc: Exception) -> Exception:
+        """Translate a raw transport/SDK error into the app's typed errors."""
+        if _looks_like_auth_error(exc):
+            return McpAuthExpired(str(exc))
+        if _looks_like_access_denied(exc):
+            return EventAccessDeniedError()
+        text = f"{exc}".lower()
+        if any(t in text for t in ("connection", "timeout", "unavailable", "503")):
+            return McpUnavailableError()
+        # Preserve the real cause; include a sanitized detail when debugging.
+        return McpError(_detail(tool_name, exc))
+
+    def walk_session_pages(self, on_page: Callable[[list], bool], *,
+                           max_pages: int, budget_seconds: float,
+                           next_token: Optional[str] = None
+                           ) -> tuple[int, Optional[str], str]:
+        """Read successive ListSessions pages over ONE MCP connection.
+
+        `list_sessions` opens a fresh connection (connect + handshake) for every
+        page, which dominates the cost of walking the ~10-page catalog. This
+        opens the connection once and reuses it, so a full walk is much cheaper.
+
+        `on_page(sessions)` is called with each page's Session list and returns
+        True to stop early (e.g. the wanted session was found). Reading also
+        stops at the last page, after `max_pages`, or once `budget_seconds` has
+        elapsed (checked between pages; at least one page is always read).
+
+        Returns ``(pages_read, next_token, stopped)`` where `next_token` resumes
+        the walk (None at the end of the catalog) and `stopped` is one of
+        ``"found"``, ``"end"``, ``"cap"`` or ``"budget"``. Errors are mapped to
+        the same typed exceptions as every other call.
+        """
+        tool_name = self._resolve_tool("list_sessions")
+        state = {"pages": 0, "token": next_token, "stopped": "budget"}
+
+        def run() -> None:
+            client = self._factory(self._access_token)
+            deadline = time.monotonic() + budget_seconds
+            with client:
+                while True:
+                    args: dict = {"eventId": self.EVENT_ID, "includeAbstracts": False}
+                    if state["token"]:
+                        args["nextToken"] = state["token"]
+                    result = client.call_tool_sync(
+                        tool_use_id=f"{tool_name}-walk-{state['pages']}",
+                        name=tool_name,
+                        arguments=args,
+                    )
+                    _raise_if_tool_error(tool_name, result)
+                    data = _extract_tool_json(result)
+                    page = [Session.from_mcp(i) for i in data.get("items", [])]
+                    state["pages"] += 1
+                    state["token"] = data.get("nextToken")
+                    if on_page(page):
+                        state["stopped"] = "found"
+                        return
+                    if not state["token"]:
+                        state["stopped"] = "end"
+                        return
+                    if state["pages"] >= max_pages:
+                        state["stopped"] = "cap"
+                        return
+                    if time.monotonic() > deadline:
+                        state["stopped"] = "budget"
+                        return
+
+        # The walk is bounded by `budget_seconds` between pages; add one call's
+        # timeout so a single slow page cannot hang past that.
+        outer = budget_seconds + self._timeout
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            future = ex.submit(run)
+            try:
+                future.result(timeout=outer)
+            except concurrent.futures.TimeoutError:
+                # Keep whatever pages were read; the caller treats this as a
+                # budget stop and can resume from state["token"].
+                state["stopped"] = "budget"
+            except (McpAuthExpired, EventAccessDeniedError, McpError,
+                    McpUnavailableError, McpTimeoutError):
+                raise
+            except Exception as exc:
+                raise self._map_exception(tool_name, exc) from exc
+        finally:
+            ex.shutdown(wait=False)
+        return state["pages"], state["token"], state["stopped"]
 
     def list_tools(self) -> list[str]:
         def run() -> list[str]:

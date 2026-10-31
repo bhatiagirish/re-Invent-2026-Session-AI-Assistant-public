@@ -161,14 +161,42 @@ def resolve_sessions_with_total(events: EventsClient, ids: list[str],
     return [by_id[sid] for sid in capped if sid in by_id], total
 
 
+def extract_session_ids(entries) -> list[str]:
+    """Pull sessionIds out of a GetSchedule ``favorites[]`` / ``reserved[]``
+    array, order-preserving.
+
+    AWS Events may return either plain id strings or objects that carry the id
+    under ``sessionId`` (or ``id``). Accepting both matters: a reader that kept
+    only strings silently dropped every object entry, so a count of reserved
+    seats came back 0 even though the schedule view (which already accepted
+    objects) showed them. Blank and duplicate ids are dropped; nothing is
+    fabricated.
+    """
+    if not isinstance(entries, list):
+        return []
+    ids: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        sid = None
+        if isinstance(entry, str):
+            sid = entry
+        elif isinstance(entry, dict):
+            sid = entry.get("sessionId") or entry.get("id") or entry.get("sessionID")
+        if not isinstance(sid, str):
+            continue
+        sid = sid.strip()
+        if sid and sid not in seen:
+            seen.add(sid)
+            ids.append(sid)
+    return ids
+
+
 def get_favorite_ids(events: EventsClient) -> list[str]:
     """Return the user's current favorite sessionIds from AWS Events (source of
     truth). Never a local cache."""
     schedule = events.get_schedule()
     if isinstance(schedule, dict):
-        favs = schedule.get("favorites")
-        if isinstance(favs, list):
-            return [f for f in favs if isinstance(f, str)]
+        return extract_session_ids(schedule.get("favorites"))
     return []
 
 

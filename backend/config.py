@@ -137,6 +137,17 @@ SCHEDULE_FETCH_WORKERS: int = int(os.environ.get("SCHEDULE_FETCH_WORKERS", "20")
 # hang. Kept well under AGENT_TURN_TIMEOUT (26s).
 SCHEDULE_FETCH_DEADLINE: int = int(os.environ.get("SCHEDULE_FETCH_DEADLINE", "15"))
 
+# ── Session-code lookup ───────────────────────────────────────────────────
+# ListSessions has no search/filter, only paging (250 per page, ~2400 sessions =
+# ~10 pages), while topic search deliberately reads only MAX_LIST_PAGES pages.
+# Looking up ONE session by its code (e.g. "IND422") must therefore walk the
+# catalog until it finds the code. These bound that walk so it can never blow
+# the agent-turn budget (AGENT_TURN_TIMEOUT).
+MAX_CODE_LOOKUP_PAGES: int = int(os.environ.get("MAX_CODE_LOOKUP_PAGES", "14"))
+CODE_LOOKUP_BUDGET_SECONDS: int = int(os.environ.get("CODE_LOOKUP_BUDGET_SECONDS", "14"))
+# How long a code->session index built from walked pages is reused (seconds).
+CODE_INDEX_TTL_SECONDS: int = int(os.environ.get("CODE_INDEX_TTL_SECONDS", "3600"))
+
 # ── Conversation memory (multi-turn history) ──────────────────────────────
 # How many prior turns (user+assistant pairs) to replay into the agent so it
 # remembers earlier context. Kept small to bound prompt size / latency.
