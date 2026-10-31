@@ -1,0 +1,73 @@
+# Publishes the interactive demo (frontend/demo) to GitHub Pages.
+#
+# The demo is static HTML/CSS/JS with sample data and makes no network calls,
+# so it keeps working after the AWS stack is destroyed.
+#
+# This workflow belongs in the PUBLIC repo only. On a free GitHub plan, Pages
+# works for public repositories, not private ones.
+#
+# One-time setup in the repo: Settings > Pages > Build and deployment >
+# Source: "GitHub Actions".
+name: Deploy demo to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; let a running deployment finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp -R frontend/. _site/
+          rm -rf _site/tests
+          # The real app's page cannot work without its AWS backend, so the
+          # site root sends visitors to the demo instead.
+          cat > _site/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta http-equiv="refresh" content="0; url=demo/index.html">
+            <link rel="canonical" href="demo/index.html">
+            <title>AWS re:Invent 2026 Session Assistant (demo)</title>
+          </head>
+          <body>
+            <p>Opening the <a href="demo/index.html">interactive demo</a>&hellip;</p>
+          </body>
+          </html>
+          EOF
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

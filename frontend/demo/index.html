@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Demo: AWS re:Invent 2026 Session Assistant</title>
+  <meta name="description" content="Interactive demo of the AWS re:Invent 2026 Session Assistant using sample data. No sign-in required." />
+  <link rel="stylesheet" href="../styles.css" />
+  <link rel="stylesheet" href="demo.css" />
+  <script src="../theme.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#chat-input">Skip to chat input</a>
+
+  <div class="demo-banner" role="note">
+    <span><strong>Demo mode.</strong> Sample data only: no sign-in and no AWS calls.
+      Sessions, rooms and speakers are fictional, and changes reset when you reload.</span>
+    <button type="button" id="demo-reset" class="demo-reset">Reset demo</button>
+  </div>
+
+  <header class="app-header" role="banner">
+    <a class="cwg-brand" href="https://cloudwithgirish.com" target="_blank"
+       rel="noopener noreferrer" aria-label="Cloud With Girish - cloudwithgirish.com">
+      <img src="../assets/cloud-with-girish.png" alt="Cloud With Girish"
+           class="cwg-logo" onerror="this.closest('.cwg-brand').style.display='none'" />
+      <span class="cwg-wordmark" aria-hidden="true">Cloud With Girish</span>
+    </a>
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">re:Invent 2026</span>
+      <div>
+        <h1>AWS re:Invent 2026</h1>
+        <p class="brand-sub">AI Session Assistant (demo)</p>
+      </div>
+    </div>
+    <div class="header-status">
+      <span id="conn-indicator" class="status-dot status-unknown" aria-hidden="true"></span>
+      <span id="conn-text" class="status-text" role="status" aria-live="polite">Checking…</span>
+      <button id="schedule-btn" class="btn btn-secondary" hidden
+              aria-haspopup="dialog">My Schedule</button>
+      <button id="auth-btn" class="btn btn-secondary" hidden>Sign In</button>
+      <button id="theme-toggle" class="theme-toggle" type="button" aria-pressed="true" aria-label="Switch to light theme" title="Switch to light theme">☀︎</button>
+    </div>
+  </header>
+
+  <main class="app-main">
+    <section id="auth-panel" class="auth-panel" hidden aria-live="polite">
+      <div class="auth-card">
+        <h2 id="auth-title">Connect your AWS identity</h2>
+        <p id="auth-message">Connect your AWS identity to explore re:Invent 2026 sessions.</p>
+        <button id="connect-btn" class="btn btn-primary">Connect to re:Invent</button>
+      </div>
+    </section>
+
+    <section id="chat-panel" class="chat-panel" hidden>
+      <div class="intro">
+        <p>Discover sessions, explore topics, and manage your re:Invent favorites.
+          Everything below runs on sample data, so click around freely.</p>
+
+        <details class="guide" open>
+          <summary>Try these in the demo</summary>
+          <div class="guide-grid">
+            <div class="guide-card">
+              <h3>Find sessions</h3>
+              <ul>
+                <li>&ldquo;Find sessions about Amazon Bedrock&rdquo;</li>
+                <li>&ldquo;Find Kiro sessions&rdquo;</li>
+                <li>&ldquo;Beginner-friendly serverless sessions&rdquo;</li>
+                <li>&ldquo;Show me workshops&rdquo;</li>
+              </ul>
+            </div>
+            <div class="guide-card">
+              <h3>Explore a session</h3>
+              <ul>
+                <li>&ldquo;Tell me more about AIM301&rdquo;</li>
+                <li>&ldquo;Tell me more about #2&rdquo;
+                  <span class="guide-hint">after a search</span></li>
+                <li>Use <strong>More Details</strong> on any card</li>
+              </ul>
+            </div>
+            <div class="guide-card">
+              <h3>Favorites</h3>
+              <ul>
+                <li>&ldquo;Favorite #2&rdquo; or the <strong>Favorite</strong> button</li>
+                <li>&ldquo;Unfavorite AIM301&rdquo;</li>
+                <li>&ldquo;Show my favorites&rdquo;</li>
+              </ul>
+            </div>
+            <div class="guide-card">
+              <h3>Reservations</h3>
+              <ul>
+                <li>&ldquo;Reserve a seat for DVT201&rdquo;</li>
+                <li>&ldquo;Reserve DVT320&rdquo;
+                  <span class="guide-hint">schedule conflict</span></li>
+                <li>&ldquo;Reserve AIM350&rdquo;
+                  <span class="guide-hint">session full</span></li>
+                <li>&ldquo;Cancel my reservation for AIM340&rdquo;</li>
+              </ul>
+            </div>
+            <div class="guide-card">
+              <h3>Schedule &amp; personal time</h3>
+              <ul>
+                <li>Click <strong>My Schedule</strong> in the header</li>
+                <li>Click a day chip, such as <strong>Schedule: Dec 2</strong></li>
+                <li>&ldquo;Add lunch Dec 1 noon to 1pm&rdquo;</li>
+                <li>&ldquo;Add the Tuesday keynote to my schedule&rdquo;</li>
+                <li>&ldquo;Delete my #1 personal time&rdquo;</li>
+              </ul>
+            </div>
+            <div class="guide-card">
+              <h3>Counts &amp; totals</h3>
+              <ul>
+                <li>&ldquo;How many sessions are on Dec 3?&rdquo;</li>
+                <li>&ldquo;How many Kiro sessions?&rdquo;</li>
+                <li>&ldquo;Sessions by venue&rdquo;</li>
+                <li>&ldquo;My favorites by venue&rdquo;</li>
+              </ul>
+            </div>
+          </div>
+          <p class="guide-note">
+            This demo uses a simple keyword matcher over about twenty
+            <strong>fictional</strong> sessions. The real app uses an AI agent
+            (Amazon Bedrock) with live data from the AWS Events MCP Server, so it
+            understands far more phrasing than this demo does.
+          </p>
+        </details>
+
+        <div class="suggestions" id="suggestions" role="group" aria-label="Suggested questions"></div>
+      </div>
+
+      <div id="conversation" class="conversation" role="log" aria-live="polite" aria-label="Conversation"></div>
+
+      <form id="chat-form" class="chat-form" autocomplete="off">
+        <label class="visually-hidden" for="chat-input">Ask about re:Invent sessions</label>
+        <textarea id="chat-input" class="chat-input" rows="1"
+          placeholder="Ask about re:Invent sessions…"></textarea>
+        <button id="send-btn" type="submit" class="btn btn-primary">Send</button>
+      </form>
+      <p id="global-error" class="global-error" role="alert" hidden></p>
+    </section>
+  </main>
+
+  <!-- Session details dialog -->
+  <div id="details-backdrop" class="modal-backdrop" hidden>
+    <div id="details-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="details-title">
+      <button id="details-close" class="modal-close" aria-label="Close details">×</button>
+      <div id="details-content"></div>
+    </div>
+  </div>
+
+  <!-- Schedule_View dialog: reserved sessions, favorites, and personal time. -->
+  <div id="schedule-backdrop" class="modal-backdrop" hidden>
+    <div id="schedule-modal" class="modal" role="dialog" aria-modal="true" aria-label="Your schedule">
+      <button id="schedule-close" class="modal-close" aria-label="Close schedule">×</button>
+      <h2 class="schedule-heading">My Schedule</h2>
+      <div class="schedule-toolbar">
+        <button id="schedule-add-btn" class="btn btn-primary" type="button">
+          Add personal time
+        </button>
+      </div>
+      <div id="schedule-form-slot" class="schedule-form-slot" hidden></div>
+      <div id="schedule-content"></div>
+    </div>
+  </div>
+
+  <!-- The real UI scripts, unchanged, in the same order as ../index.html. The
+       only difference: demo-api.js replaces ../api.js, so window.API is a mock
+       and no network request is ever made. -->
+  <script src="../config.js"></script>
+  <script src="demo-data.js"></script>
+  <script src="demo-api.js"></script>
+  <script src="../auth.js"></script>
+  <script src="../sessions.js"></script>
+  <script src="../favorites.js"></script>
+  <script src="../reservations.js"></script>
+  <script src="../schedule.js"></script>
+  <script src="../personal-time-form.js"></script>
+  <script src="../schedule-view.js"></script>
+  <script src="../chat.js"></script>
+  <script src="../app.js"></script>
+  <script src="demo-boot.js"></script>
+</body>
+</html>

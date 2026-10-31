@@ -12,6 +12,26 @@ session data. The app never invents sessions and keeps no fake local favorites.
 > identity. It is not multi-user SaaS: there are no sign-ups, no user accounts
 > and no user directory.
 
+## Live demo
+
+Try the interface in your browser, with no sign-in and no AWS account:
+**[Open the live demo](https://d1m09v5dappo02.cloudfront.net/demo/index.html)**
+
+The demo runs the real front-end code against about twenty **fictional**
+sample sessions, so you can click through search, details, favorites,
+reservations, the schedule view and personal time. A few things to know:
+
+- It uses a simple keyword matcher instead of the AI agent, so it understands
+  far fewer phrasings than the real app, which uses Amazon Bedrock and live data
+  from the AWS Events MCP Server.
+- No requests go to AWS. Changes live in your browser tab and reset when you
+  reload (or press **Reset demo**).
+- Sessions, rooms and speakers are made up and are not the real re:Invent catalog.
+
+Things to try: "Find Kiro sessions", "Tell me more about #1", "Favorite #2",
+"Reserve a seat for DVT201", "Show my schedule for 2026-12-02", and
+"Add lunch Dec 1 noon to 1pm".
+
 ## What you can do
 
 Ask in plain language, or use the buttons on each session card.
