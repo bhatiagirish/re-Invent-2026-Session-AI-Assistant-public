@@ -112,29 +112,18 @@ flowchart TD
 
 ### Catalog index
 
-AWS Events' `ListSessions` returns the catalog only in pages (250 sessions per
-page, about 2,400 in all), with no search or filter, and reading every page
-takes longer than one chat turn. So the backend keeps a compact **index of the
-public session catalog** in DynamoDB:
+AWS Events lists sessions only in pages (about 2,400 sessions, 250 per page) and
+has no search, so reading everything is too slow for a chat turn. The backend
+therefore keeps a compact, regularly refreshed **index of the public session
+catalog** in DynamoDB, built in the background after you connect.
 
-- **Built in the background.** After you connect, the page asks the backend to
-  build or check the index (`POST /catalog/warm`), a bounded step at a time. It
-  never blocks the chat.
-- **Used to find, not to show.** The index decides which sessions match a
-  search, a count or a session code. The sessions shown to you are re-read live
-  from AWS Events, so room, time and availability are current, and a session
-  that no longer exists is left out.
-- **Favorites in the schedule.** To keep a long favorites list fast, favorites'
-  details in **My Schedule** come from the index, labelled "Favorite details as
-  of N min ago". Reserved sessions are always re-read live, and which sessions
-  are on your schedule always comes live from AWS Events.
-- **Kept fresh.** The catalog size is re-checked about every 15 minutes and the
-  index is rebuilt about every hour while you are connected; the old index keeps
-  serving until the new one is ready. An index older than 6 hours is not used.
-- **Honest about coverage.** Search and count results say what they covered.
-  Until the index is ready, search falls back to the first part of the catalog
-  and says so. Right after a fresh deploy, **My Schedule** shows "Preparing your
-  schedule…" for up to about a minute while the index is built.
+- **Finds, then re-checks.** The index decides which sessions match a search,
+  count or session code; the sessions you see are re-read live from AWS Events,
+  so their details are current.
+- **Speeds up the schedule.** Favorites' details in **My Schedule** come from the
+  index (labelled with its age); reserved sessions are always read live.
+- **Stays fresh and honest.** It is rebuilt about hourly while you are connected,
+  and results say when they could not cover the whole catalog.
 
 Your favorites, reservations, schedule and personal time are never cached.
 
