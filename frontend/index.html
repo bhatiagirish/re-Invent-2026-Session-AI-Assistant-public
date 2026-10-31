@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AWS re:Invent 2026 Session Assistant</title>
+  <meta name="description" content="Discover and manage your AWS re:Invent 2026 sessions." />
+  <link rel="stylesheet" href="styles.css" />
+  <script src="theme.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#chat-input">Skip to chat input</a>
+
+  <header class="app-header" role="banner">
+    <a class="cwg-brand" href="https://cloudwithgirish.com" target="_blank"
+       rel="noopener noreferrer" aria-label="Cloud With Girish - cloudwithgirish.com">
+      <img src="assets/cloud-with-girish.png" alt="Cloud With Girish"
+           class="cwg-logo" onerror="this.closest('.cwg-brand').style.display='none'" />
+      <span class="cwg-wordmark" aria-hidden="true">Cloud With Girish</span>
+    </a>
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">re:Invent 2026</span>
+      <div>
+        <h1>AWS re:Invent 2026</h1>
+        <p class="brand-sub">AI Session Assistant</p>
+      </div>
+    </div>
+    <div class="header-status">
+      <span id="conn-indicator" class="status-dot status-unknown" aria-hidden="true"></span>
+      <span id="conn-text" class="status-text" role="status" aria-live="polite">Checking…</span>
+      <!-- Persistent Schedule_View control (Req 23.1): opens the schedule with
+           one click, no chat message needed. Shown only while authorized. -->
+      <button id="schedule-btn" class="btn btn-secondary" hidden
+              aria-haspopup="dialog">My Schedule</button>
+      <button id="auth-btn" class="btn btn-secondary" hidden>Sign In</button>
+      <button id="theme-toggle" class="theme-toggle" type="button" aria-pressed="true" aria-label="Switch to light theme" title="Switch to light theme">☀︎</button>
+    </div>
+  </header>
+
+  <main class="app-main">
+    <!-- Auth gate: shown when not authenticated / not authorized -->
+    <section id="auth-panel" class="auth-panel" hidden aria-live="polite">
+      <div class="auth-card">
+        <h2 id="auth-title">Connect your AWS identity</h2>
+        <p id="auth-message">Connect your AWS identity to explore re:Invent 2026 sessions.</p>
+        <button id="connect-btn" class="btn btn-primary">Connect to re:Invent</button>
+      </div>
+    </section>
+
+    <!-- Chat experience: shown when authorized -->
+    <section id="chat-panel" class="chat-panel" hidden>
+      <div class="intro">
+        <p>Discover sessions, explore topics, and manage your re:Invent favorites.</p>
+
+        <details class="guide" open>
+          <summary>What you can ask</summary>
+          <div class="guide-grid">
+            <div class="guide-card">
+              <h3>Find sessions</h3>
+              <ul>
+                <li>&ldquo;Find sessions about Amazon Bedrock&rdquo;</li>
+                <li>&ldquo;Show me AI agent sessions&rdquo;</li>
+                <li>&ldquo;Beginner-friendly serverless sessions&rdquo;</li>
+                <li>&ldquo;Workshops about generative AI&rdquo;</li>
+              </ul>
+            </div>
+            <div class="guide-card">
+              <h3>Explore a session</h3>
+              <ul>
+                <li>&ldquo;Tell me more about DVT307&rdquo;</li>
+                <li>&ldquo;Details on AIM350&rdquo;</li>
+                <li>&ldquo;Who are the speakers for that one?&rdquo;</li>
+              </ul>
+            </div>
+            <div class="guide-card">
+              <h3>Manage favorites</h3>
+              <ul>
+                <li>&ldquo;Favorite AIM350&rdquo;</li>
+                <li>&ldquo;Unfavorite AIM350&rdquo;</li>
+                <li>&ldquo;Show my favorites&rdquo;</li>
+              </ul>
+            </div>
+            <div class="guide-card">
+              <h3>Manage reservations</h3>
+              <ul>
+                <li>&ldquo;Reserve a seat for AIM350&rdquo;</li>
+                <li>&ldquo;Cancel my reservation for AIM350&rdquo;</li>
+                <li>&ldquo;Show my reserved sessions&rdquo;</li>
+              </ul>
+            </div>
+            <div class="guide-card">
+              <h3>Your schedule &amp; personal time</h3>
+              <ul>
+                <li>&ldquo;Show my schedule&rdquo;
+                  <span class="guide-hint">favorites &amp; personal time</span></li>
+                <li>&ldquo;Add the Tuesday keynote to my schedule&rdquo;
+                  <span class="guide-hint">one example</span></li>
+                <li>&ldquo;Add a personal time block for lunch on Dec 1 from 12:00 to 1:00 PM&rdquo;
+                  <span class="guide-hint">Pacific times</span></li>
+                <li>&ldquo;Change my #1 personal time to 1:00&ndash;2:00 PM&rdquo;
+                  <span class="guide-hint">edit</span></li>
+                <li>&ldquo;Delete my #2 personal time&rdquo;
+                  <span class="guide-hint">remove</span></li>
+              </ul>
+            </div>
+            <div class="guide-card">
+              <h3>Counts &amp; totals</h3>
+              <ul>
+                <li>&ldquo;How many favorites do I have?&rdquo;
+                  <span class="guide-hint">favorites total</span></li>
+                <li>&ldquo;How many favorites on 2026-12-02?&rdquo;
+                  <span class="guide-hint">favorites, by date</span></li>
+                <li>&ldquo;My favorites by venue&rdquo;
+                  <span class="guide-hint">favorites, grouped</span></li>
+                <li>&ldquo;My reserved sessions by venue&rdquo;
+                  <span class="guide-hint">reserved, grouped</span></li>
+                <li>&ldquo;How many sessions at MGM Grand?&rdquo;
+                  <span class="guide-hint">whole catalog, by venue</span></li>
+                <li>&ldquo;How many Bedrock sessions?&rdquo;
+                  <span class="guide-hint">whole catalog, by topic</span></li>
+              </ul>
+            </div>
+          </div>
+          <p class="guide-note">
+            Tip: search by <strong>topic, AWS service, level, or session type</strong>.
+            Results come live from AWS Events &mdash; the assistant shows a handful
+            of the most relevant matches rather than counting the full catalog, so
+            search by theme (e.g. &ldquo;Bedrock workshops&rdquo;), and ask &ldquo;how
+            many&rdquo; about your favorites (fast) or the whole catalog.
+          </p>
+        </details>
+
+        <div class="suggestions" id="suggestions" role="group" aria-label="Suggested questions"></div>
+      </div>
+
+      <div id="conversation" class="conversation" role="log" aria-live="polite" aria-label="Conversation"></div>
+
+      <form id="chat-form" class="chat-form" autocomplete="off">
+        <label class="visually-hidden" for="chat-input">Ask about re:Invent sessions</label>
+        <textarea id="chat-input" class="chat-input" rows="1"
+          placeholder="Ask about re:Invent sessions…"></textarea>
+        <button id="send-btn" type="submit" class="btn btn-primary">Send</button>
+      </form>
+      <p id="global-error" class="global-error" role="alert" hidden></p>
+    </section>
+  </main>
+
+  <!-- Session details dialog -->
+  <div id="details-backdrop" class="modal-backdrop" hidden>
+    <div id="details-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="details-title">
+      <button id="details-close" class="modal-close" aria-label="Close details">×</button>
+      <div id="details-content"></div>
+    </div>
+  </div>
+
+  <!-- Schedule_View dialog: reserved sessions, favorites, and personal time. -->
+  <div id="schedule-backdrop" class="modal-backdrop" hidden>
+    <div id="schedule-modal" class="modal" role="dialog" aria-modal="true" aria-label="Your schedule">
+      <button id="schedule-close" class="modal-close" aria-label="Close schedule">×</button>
+      <h2 class="schedule-heading">My Schedule</h2>
+      <!-- Personal-time controls (Req 23.4): add is always available; the
+           add/edit form renders into #schedule-form-slot, the list into
+           #schedule-content. -->
+      <div class="schedule-toolbar">
+        <button id="schedule-add-btn" class="btn btn-primary" type="button">
+          Add personal time
+        </button>
+      </div>
+      <div id="schedule-form-slot" class="schedule-form-slot" hidden></div>
+      <div id="schedule-content"></div>
+    </div>
+  </div>
+
+  <script src="config.js"></script>
+  <script src="api.js"></script>
+  <script src="auth.js"></script>
+  <script src="sessions.js"></script>
+  <script src="favorites.js"></script>
+  <script src="reservations.js"></script>
+  <script src="schedule.js"></script>
+  <script src="personal-time-form.js"></script>
+  <script src="schedule-view.js"></script>
+  <script src="chat.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

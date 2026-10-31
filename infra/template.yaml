@@ -1,0 +1,456 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  re:Invent 2026 Session Assistant - single-user personal app (Cloud With
+  Girish demo). Serverless stack: HTTP API Gateway + Lambda (Strands agent on
+  Amazon Bedrock, calling the AWS Events MCP server), DynamoDB (one app session
+  + OAuth transients + conversation context, TTL), a KMS key for access-token
+  encryption, Secrets Manager for the refresh token, a private S3 bucket +
+  CloudFront (OAC, HTTPS) for the static frontend, and CloudWatch logging.
+
+Parameters:
+  FrontendOrigin:
+    Type: String
+    Default: ""
+    Description: CloudFront/SPA origin for CORS + post-login redirect.
+  OAuthRedirectUri:
+    Type: String
+    Description: Hosted callback URL registered with the Cognito app client.
+  OAuthClientSecretArn:
+    Type: String
+    Default: ""
+    Description: Secrets Manager ARN of the OAuth client secret. Empty for a public (PKCE) client.
+  EventId:
+    Type: String
+    Default: reinvent2026
+  BedrockModelId:
+    Type: String
+    Default: us.anthropic.claude-haiku-4-5-20251001-v1:0
+    Description: Bedrock model id (inference profile) used by the Strands agent.
+  ReservationsEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Enables the phased reservation capability (reserve/cancel routes, agent
+      tools, and reserved-list reads). Defaults to "false" so the capability
+      stays dormant; set to "true" at deploy time once the live AWS Events MCP
+      reservation contract is verified.
+
+Conditions:
+  HasClientSecret: !Not [!Equals [!Ref OAuthClientSecretArn, ""]]
+  HasFrontendOrigin: !Not [!Equals [!Ref FrontendOrigin, ""]]
+
+Globals:
+  Function:
+    Timeout: 29
+    MemorySize: 512
+    Runtime: python3.12
+    Architectures: [arm64]
+
+Resources:
+
+  TokenKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encrypts cached OAuth access tokens in the sessions table.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRoot
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+  AdminKey:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Admin key for POST /admin/connect (single-user native token push).
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: admin_key
+        PasswordLength: 40
+        ExcludePunctuation: true
+
+  AssistantTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ReInventAssistant
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          EVENT_ID: !Ref EventId
+          DDB_TABLE_NAME: !Ref AssistantTable
+          KMS_KEY_ID: !Ref TokenKey
+          FRONTEND_ORIGIN: !Ref FrontendOrigin
+          OAUTH_REDIRECT_URI: !Ref OAuthRedirectUri
+          OAUTH_CLIENT_SECRET_ARN: !Ref OAuthClientSecretArn
+          MCP_ENDPOINT: https://api.awsevents.com/mcp
+          OAUTH_CLIENT_ID: 7vmom55m1qstvq8i71ph127bfq
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          RESERVATIONS_ENABLED: !Ref ReservationsEnabled
+          DEFAULT_SESSION_RESULT_LIMIT: "5"
+          MAX_SESSION_RESULT_LIMIT: "25"
+          ADMIN_KEY_SECRET_ARN: !Ref AdminKey
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AssistantTable
+        - Statement:
+            - Effect: Allow
+              Action: [kms:Encrypt, kms:Decrypt, kms:GenerateDataKey]
+              Resource: !GetAtt TokenKey.Arn
+        - Statement:
+            - Effect: Allow
+              Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+              Resource:
+                - !Sub 'arn:aws:bedrock:*::foundation-model/*'
+                - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*'
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:CreateSecret
+                - secretsmanager:PutSecretValue
+                - secretsmanager:GetSecretValue
+                - secretsmanager:DeleteSecret
+              Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:reinvent-assistant/refresh/*'
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref AdminKey
+        - !If
+          - HasClientSecret
+          - Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref OAuthClientSecretArn
+          - !Ref 'AWS::NoValue'
+      Events:
+        AuthLogin:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /auth/login
+        AuthCallback:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /auth/callback
+        AuthStatus:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /auth/status
+        Logout:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: /logout
+        Chat:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: /chat
+        AdminConnect:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: /admin/connect
+        AdminClaim:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: /admin/claim
+        GetFavorites:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /favorites
+        GetFavoriteIds:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /favorites/ids
+        PostFavorite:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: /favorites
+        DeleteFavorite:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: DELETE
+            Path: /favorites/{sessionId}
+        DebugEvents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /debug/events
+        GetSchedule:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /schedule
+        PostPersonalTime:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: /personal-time
+        PutPersonalTime:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: PUT
+            Path: /personal-time/{personalTimeId}
+        DeletePersonalTime:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: DELETE
+            Path: /personal-time/{personalTimeId}
+        PostReservation:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: /reservations
+        DeleteReservation:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: DELETE
+            Path: /reservations/{sessionId}
+        GetReservations:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /reservations
+        GetReservedIds:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /reservations/ids
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration: !If
+        - HasFrontendOrigin
+        - AllowOrigins: [!Ref FrontendOrigin]
+          AllowMethods: [GET, POST, DELETE, OPTIONS]
+          AllowHeaders: [content-type, x-csrf-token]
+          AllowCredentials: true
+        - !Ref 'AWS::NoValue' 
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogs.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","route":"$context.routeKey","status":"$context.status","latency":"$context.responseLatency"}'
+
+  ApiAccessLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /reinvent-assistant/http-api-access
+      RetentionInDays: 30
+
+  # ── Frontend: private S3 bucket behind CloudFront (OAC, HTTPS) ─────────────
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-frontend-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: FrontendS3
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref FrontendOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+          - Id: BackendApi
+            # HttpApi default endpoint host (strip https:// from the ApiId URL).
+            DomainName: !Sub '${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: FrontendS3
+          ViewerProtocolPolicy: redirect-to-https
+          # AWS managed CachingOptimized policy id.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          Compress: true
+        CacheBehaviors:
+          - PathPattern: /auth/*
+            TargetOriginId: BackendApi
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad          # CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # AllViewerExceptHostHeader
+          - PathPattern: /chat
+            TargetOriginId: BackendApi
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: /favorites
+            TargetOriginId: BackendApi
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: /favorites/*
+            TargetOriginId: BackendApi
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: /admin/*
+            TargetOriginId: BackendApi
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: /logout
+            TargetOriginId: BackendApi
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: /schedule
+            TargetOriginId: BackendApi
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: /personal-time
+            TargetOriginId: BackendApi
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: /personal-time/*
+            TargetOriginId: BackendApi
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: /reservations
+            TargetOriginId: BackendApi
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: /reservations/*
+            TargetOriginId: BackendApi
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}'
+
+Outputs:
+  ApiBaseUrl:
+    Description: Base URL of the HTTP API. Register ApiBaseUrl/auth/callback with the Cognito app client.
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  TableName:
+    Value: !Ref AssistantTable
+  KmsKeyId:
+    Value: !Ref TokenKey
+  FrontendBucketName:
+    Description: Upload the built frontend/ files here, then invalidate the distribution.
+    Value: !Ref FrontendBucket
+  FrontendUrl:
+    Description: CloudFront URL of the frontend. Use this as FrontendOrigin and the OAuth redirect base.
+    Value: !Sub 'https://${FrontendDistribution.DomainName}'
+  AdminKeySecretArn:
+    Description: >
+      Secrets Manager ARN holding the admin key for POST /admin/connect. Fetch it
+      with: aws secretsmanager get-secret-value --secret-id <this-arn>
+      --query SecretString. Use its admin_key value as APP_ADMIN_KEY for connect.py.
+    Value: !Ref AdminKey

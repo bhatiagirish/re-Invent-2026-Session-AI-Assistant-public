@@ -1,0 +1,266 @@
+/* schedule-view.js — persistent "My Schedule" control + Schedule_View wiring
+ * (Req 23.1).
+ *
+ * Provides a labeled control (the header "My Schedule" button) that opens the
+ * Schedule_View without typing a chat message. The control is only usable while
+ * the owner is authorized (authState === "authorized"); it stays hidden
+ * otherwise. Activating it calls GET /schedule on the application backend and
+ * renders the result via window.Schedule.renderScheduleView (built in 10.1).
+ *
+ * On a failed/non-2xx fetch the error state is rendered by passing
+ * {error:true, message} to renderScheduleView — never a partial or cached view.
+ *
+ * This module also exposes the create/update/delete personal-time handlers that
+ * app.js registers. The input form itself is task 10.3; these handlers accept an
+ * already-prepared entry (or id) object, call the backend, and on confirmed
+ * success refresh the Schedule_View so it reflects AWS Events state.
+ *
+ * The browser talks ONLY to the application backend, never to AWS Events MCP.
+ */
+(function () {
+  function el(id) { return document.getElementById(id); }
+
+  function els() {
+    return {
+      openBtn: el("schedule-btn"),
+      backdrop: el("schedule-backdrop"),
+      modal: el("schedule-modal"),
+      closeBtn: el("schedule-close"),
+      content: el("schedule-content"),
+      addBtn: el("schedule-add-btn"),
+      formSlot: el("schedule-form-slot"),
+    };
+  }
+
+  // Show/hide the persistent control based on authorization. Called by app.js
+  // after every auth-status check so the control appears exactly in State 3.
+  function setAuthorized(authorized) {
+    const e = els();
+    if (e.openBtn) e.openBtn.hidden = !authorized;
+    if (!authorized) closeView();
+  }
+
+  function renderInto(node) {
+    const e = els();
+    if (!e.content) return;
+    e.content.innerHTML = "";
+    e.content.appendChild(node);
+  }
+
+  function showLoading() {
+    const e = els();
+    if (!e.content) return;
+    const div = document.createElement("div");
+    div.className = "schedule-state schedule-loading";
+    div.innerHTML = '<p class="schedule-state-title">Loading your schedule…</p>';
+    renderInto(div);
+  }
+
+  function openModal() {
+    const e = els();
+    if (e.backdrop) e.backdrop.hidden = false;
+    if (e.closeBtn) e.closeBtn.focus();
+  }
+
+  function closeView() {
+    const e = els();
+    if (e.backdrop) e.backdrop.hidden = true;
+    hideForm();
+  }
+
+  // Fetch GET /schedule and render it. On any failure render the error state via
+  // renderScheduleView({error:true,...}) so no partial/cached view is shown.
+  async function refresh() {
+    if (!window.Schedule || typeof window.Schedule.renderScheduleView !== "function") {
+      return;
+    }
+    showLoading();
+    try {
+      const { data } = await window.API.getSchedule();
+      renderInto(window.Schedule.renderScheduleView(data || {}, {}));
+    } catch (err) {
+      if (err && err.category === "AUTH_REQUIRED" && window.Auth) {
+        window.Auth.checkAuthStatus();
+      }
+      const message = (err && err.category === "NETWORK")
+        ? "Unable to reach the Session Assistant. Please check your connection."
+        : "Please try again.";
+      renderInto(window.Schedule.renderScheduleView(null, { error: true, message }));
+    }
+  }
+
+  // Open the Schedule_View. Guarded by authorization so it never surfaces MCP
+  // state for an unauthorized session.
+  async function open() {
+    if (window.Auth && typeof window.Auth.isAuthorized === "function" &&
+        !window.Auth.isAuthorized()) {
+      return;
+    }
+    openModal();
+    await refresh();
+  }
+
+  // ── Personal-time handlers (registered by app.js) ──────────────────────────
+  // The entry/id payloads are prepared by the form (task 10.3). Each handler
+  // calls the backend, refreshes the view only on confirmed success, and returns
+  // the ActionResult-style object so the caller (form) can keep entered values
+  // and surface a non-blocking error on failure. State is left unchanged on
+  // failure/timeout.
+  async function createPersonalTime(entry) {
+    const { data } = await window.API.createPersonalTime(entry);
+    const action = data && data.action;
+    if (action && action.status === "success") await refresh();
+    return action || { status: "failed" };
+  }
+
+  async function updatePersonalTime(personalTimeId, entry) {
+    const { data } = await window.API.updatePersonalTime(personalTimeId, entry);
+    const action = data && data.action;
+    if (action && action.status === "success") await refresh();
+    return action || { status: "failed" };
+  }
+
+  async function deletePersonalTime(personalTimeId, card) {
+    let data;
+    try {
+      ({ data } = await window.API.deletePersonalTime(personalTimeId));
+    } catch (err) {
+      if (window.Chat) window.Chat.notify(
+        "The personal time block couldn't be deleted. Please try again.", true);
+      return { status: "failed" };
+    }
+    const action = data && data.action;
+    if (action && action.status === "success") {
+      // Remove the exact card the user clicked (it may be in the chat
+      // conversation, NOT the modal), then also refresh the modal if it's open
+      // so both views stay consistent.
+      if (card && typeof card.remove === "function") card.remove();
+      const e = els();
+      if (e.backdrop && !e.backdrop.hidden) await refresh();
+      if (window.Chat) window.Chat.notify("Personal time block deleted.");
+    } else {
+      if (window.Chat) window.Chat.notify(
+        (action && action.message) ||
+        "The personal time block couldn't be deleted. Please try again.", true);
+    }
+    return action || { status: "failed" };
+  }
+
+  // ── Personal-time form (task 10.3) ─────────────────────────────────────────
+  // The add/edit form (window.PersonalTimeForm) renders into #schedule-form-slot
+  // above the list. On a confirmed success the handlers already refresh the
+  // view (ScheduleView.create/update/deletePersonalTime), so onDone just closes
+  // the form; on failure the form stays open and populated for retry.
+  function hideForm() {
+    const e = els();
+    if (e.formSlot) { e.formSlot.hidden = true; e.formSlot.innerHTML = ""; }
+    if (e.addBtn) e.addBtn.disabled = false;
+  }
+
+  function openForm(mode, item) {
+    if (!window.PersonalTimeForm || typeof window.PersonalTimeForm.open !== "function") {
+      return;
+    }
+    const e = els();
+    if (!e.formSlot) return;
+    if (e.addBtn) e.addBtn.disabled = true;
+    e.formSlot.hidden = false;
+    window.PersonalTimeForm.open(e.formSlot, {
+      mode: mode,
+      item: item,
+      onDone: hideForm,     // refresh already happened on success
+      onCancel: hideForm,
+    });
+  }
+
+  // Build the item payload for the edit form from a personal-time card's
+  // data-attrs (stashed by schedule.js, Pacific-local for start/end).
+  function editItemFromCard(card) {
+    if (!card || !card.dataset) return null;
+    return {
+      personalTimeId: card.dataset.personalTimeId || "",
+      title: card.dataset.title || "",
+      start: card.dataset.startLocal || "",
+      end: card.dataset.endLocal || "",
+      location: card.dataset.location || "",
+      description: card.dataset.description || "",
+    };
+  }
+
+  // Event delegation for Edit / Delete buttons on personal-time cards. The
+  // Personal-time cards are rendered BOTH in the My Schedule modal and inline in
+  // the chat conversation, and are re-rendered on every refresh. So we delegate
+  // from DOCUMENT (not just the modal container) and match the Edit/Delete
+  // button via closest(), so the controls work wherever the card appears.
+  function onPersonalTimeClick(ev) {
+    const t = ev && ev.target;
+    if (!t || typeof t.closest !== "function") return;
+    const editBtn = t.closest("[data-pt-edit]");
+    if (editBtn) {
+      const card = closestCard(editBtn);
+      const item = editItemFromCard(card);
+      if (item) {
+        openModalIfClosed();   // edit form lives in the modal; open it if needed
+        openForm("edit", item);
+      }
+      return;
+    }
+    const delBtn = t.closest("[data-pt-delete]");
+    if (delBtn) {
+      const id = delBtn.getAttribute("data-pt-delete");
+      const card = closestCard(delBtn);
+      if (id) deletePersonalTime(id, card);
+    }
+  }
+
+  // The edit form renders into the modal's #schedule-form-slot, so if the user
+  // clicked Edit on a chat-rendered card (modal closed), open the modal first.
+  function openModalIfClosed() {
+    const e = els();
+    if (e.backdrop && e.backdrop.hidden) openModal();
+  }
+
+  // Walk up to the enclosing personal-time card (carries data-personal-time-id).
+  function closestCard(node) {
+    let n = node;
+    while (n) {
+      if (n.dataset && n.dataset.personalTimeId != null && n.dataset.personalTimeId !== undefined) {
+        if (n.classList && n.classList.contains("kind-personal")) return n;
+      }
+      n = n.parentNode;
+    }
+    return null;
+  }
+
+  function wire() {
+    const e = els();
+    if (e.openBtn) e.openBtn.addEventListener("click", open);
+    if (e.closeBtn) e.closeBtn.addEventListener("click", closeView);
+    if (e.addBtn) e.addBtn.addEventListener("click", () => openForm("add", null));
+    // Delegate from document so Edit/Delete work on personal-time cards whether
+    // they are shown in the modal or inline in the chat conversation.
+    document.addEventListener("click", onPersonalTimeClick);
+    if (e.backdrop) {
+      e.backdrop.addEventListener("click", (ev) => {
+        if (ev.target === e.backdrop) closeView();
+      });
+    }
+    document.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape" && e.backdrop && !e.backdrop.hidden) closeView();
+    });
+  }
+
+  window.ScheduleView = {
+    wire,
+    setAuthorized,
+    open,
+    refresh,
+    close: closeView,
+    createPersonalTime,
+    updatePersonalTime,
+    deletePersonalTime,
+    // Exposed for the add/edit controls and unit tests (10.3 / 10.6).
+    openForm,
+    hideForm,
+  };
+})();

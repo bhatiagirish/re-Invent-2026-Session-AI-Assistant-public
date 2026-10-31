@@ -1,0 +1,5 @@
+# Dev/test-only dependencies.
+-r requirements.txt
+pytest>=8.0.0
+hypothesis
+
