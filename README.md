@@ -300,11 +300,6 @@ aws cloudformation describe-stacks --stack-name "$STACK" --region "$AWS_REGION"
 The KMS key is scheduled for deletion with a waiting period (about 7 to 30 days)
 by AWS design, at a cost of cents.
 
-## Cost
-
-With light personal use the stack costs roughly a dollar or two per month if left
-running: Lambda, API Gateway and DynamoDB are pay-per-use, plus Bedrock tokens,
-one KMS key and a few secrets. Tear it down when you are not using it.
 
 ## Limitations
 
