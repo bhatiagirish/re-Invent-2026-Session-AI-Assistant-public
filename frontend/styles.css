@@ -284,6 +284,14 @@ body {
 .schedule-state.schedule-error { background: #fdecea; border-color: #f5c6c0; }
 .schedule-state.schedule-error .schedule-state-title { color: var(--err); }
 
+/* Shown above a schedule that is not complete (cap, deadline, or unloadable
+   sessions), so a cut-off list is never mistaken for the whole schedule. */
+.schedule-note {
+  margin: 0 0 12px; padding: 8px 12px; font-size: .88rem; color: var(--ink-soft);
+  background: rgba(236,114,17,.08); border-left: 3px solid var(--accent);
+  border-radius: 6px;
+}
+
 /* Kind badge: exactly one per item, color-coded by kind (Req 17.3). */
 .kind-badge {
   display: inline-block; font-size: .68rem; font-weight: 700;

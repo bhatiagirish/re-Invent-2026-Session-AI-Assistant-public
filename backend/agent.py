@@ -636,28 +636,23 @@ def _show_schedule_impl(events: EventsClient, recorder: SessionRecorder,
                     "Say so plainly for that day.")
         return ("EMPTY_SCHEDULE: the user has no reserved sessions, favorites, or "
                 "personal-time blocks yet.")
-    # The raw GetSchedule id arrays are the TRUE counts; the Schedule_View only
-    # holds the sessions whose details were resolved (bounded fan-out). When the
-    # FULL list was truncated, surface "showing N of M" so the model never
-    # implies the shown schedule is complete (Property 8 / no fabrication).
-    # Skip this entirely for a day-scoped view: there the lower count is just
-    # other days being filtered out, not truncation -- a "showing N of M" there
-    # would be misleading.
+    # The view carries its own completeness marker (view.incomplete): the raw
+    # GetSchedule id arrays are the TRUE counts, and the view only holds the
+    # sessions whose details could be loaded (size cap, deadline, or sessions
+    # AWS Events lists but cannot return). Surface "showing N of M" so the model
+    # never implies the shown schedule is complete (Property 8 / no
+    # fabrication). This also avoids a second GetSchedule round trip.
     partial = ""
-    if not date:
-        try:
-            raw = events.get_schedule()
-            total_reserved = len(sched._extract_session_ids(raw.get("reserved") or []))
-            total_fav = len(sched._extract_session_ids(raw.get("favorites") or []))
-        except Exception:
-            total_reserved, total_fav = n_reserved, n_fav
-        notes = []
-        if n_reserved < total_reserved:
-            notes.append(f"reserved: showing {n_reserved} of {total_reserved}")
-        if n_fav < total_fav:
-            notes.append(f"favorites: showing {n_fav} of {total_fav}")
-        partial = (" PARTIAL (" + "; ".join(notes) + ") - tell the user some items "
-                   "are not shown.") if notes else ""
+    notes = []
+    for kind in ("reserved", "favorites"):
+        inc = view.incomplete.get(kind)
+        if inc:
+            notes.append(f"{kind}: {inc['loaded']} of {inc['total']} could be loaded")
+    if notes:
+        scope = (" and that this day's list may be missing some" if date
+                 else " and that only part of the list is shown")
+        partial = (" PARTIAL (" + "; ".join(notes) + ") - tell the user some "
+                   "sessions could not be loaded" + scope + ".")
     header = ("SCHEDULE{}: {} reserved session(s), {} favorite(s), {} personal-time "
               "block(s).{} Reserved seats, favorites, and personal time are distinct "
               "kinds.").format(day_label, n_reserved, n_fav, n_personal, partial)
@@ -699,7 +694,20 @@ def _find_conflicts_impl(events: EventsClient, recorder: SessionRecorder,
     # Keep the cards in sync with the (possibly day-filtered) view.
     recorder.record_schedule("find_schedule_conflicts", view)
     conflicts = sched.find_conflicts(view)
+    # Conflicts can only be found among sessions that were loaded. If some could
+    # not be loaded, say so instead of declaring the schedule clash-free.
+    caveat = ""
+    if view.incomplete:
+        parts = [f"{kind} {inc['loaded']} of {inc['total']}"
+                 for kind, inc in view.incomplete.items()]
+        caveat = (" CAVEAT: only part of the schedule could be loaded ("
+                  + "; ".join(parts) + "), so clashes involving the missing "
+                  "sessions cannot be ruled out. Tell the user this.")
     if not conflicts:
+        if caveat:
+            return (f"NO_CONFLICTS_FOUND: none among the sessions that loaded"
+                    f"{day_label}.{caveat} Do NOT say the schedule is fully "
+                    f"clear of time clashes.")
         return (f"NO_CONFLICTS: no overlapping items on the user's schedule"
                 f"{day_label}. Tell them their schedule is clear of time clashes"
                 f"{day_label}.")
@@ -709,6 +717,8 @@ def _find_conflicts_impl(events: EventsClient, recorder: SessionRecorder,
         a, b = c["a"], c["b"]
         lines.append(f"- [{a['kind']}] {a['label']} ({a['window']})  CLASHES WITH  "
                      f"[{b['kind']}] {b['label']} ({b['window']})")
+    if caveat:
+        lines.append(caveat.strip())
     return "\n".join(lines)
 
 

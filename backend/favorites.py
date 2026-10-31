@@ -151,10 +151,23 @@ def resolve_sessions_with_total(events: EventsClient, ids: list[str],
 
     by_id: dict = {}
     workers = min(config.SCHEDULE_FETCH_WORKERS, len(capped))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        for sid, sess in ex.map(fetch, capped):
-            if sess:
-                by_id[sid] = sess
+    # Overall deadline (config.SCHEDULE_FETCH_DEADLINE): collect whatever has
+    # resolved in time and skip stragglers (never fabricated) instead of letting
+    # a slow batch run into the Lambda / agent-turn timeout. `total` still
+    # reports the true count, so the caller says "showing N of M".
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = [ex.submit(fetch, sid) for sid in capped]
+        try:
+            for fut in concurrent.futures.as_completed(
+                    futures, timeout=config.SCHEDULE_FETCH_DEADLINE):
+                sid, sess = fut.result()
+                if sess:
+                    by_id[sid] = sess
+        except concurrent.futures.TimeoutError:
+            pass
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
     if auth_expired:
         raise auth_expired[0]
     # Preserve the original id ordering; omit un-fetchable ids (no fabrication).

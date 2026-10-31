@@ -157,6 +157,7 @@ def to_utc_contract(start: str, end: str) -> tuple[str, str]:
 # nothing is invented (Req 17.7, 22.2).
 
 import concurrent.futures
+import time
 from typing import Optional
 
 from errors import McpError, McpTimeoutError, McpUnavailableError
@@ -189,14 +190,16 @@ def _extract_session_ids(entries: list) -> list[str]:
     return ids
 
 
-def _resolve_sessions(events, ids: list[str], max_details: Optional[int] = None) -> list[Session]:
+def _resolve_sessions(events, ids: list[str], max_details: Optional[int] = None,
+                      deadline: Optional[float] = None) -> list[Session]:
     """Resolve sessionIds to Session details via a bounded concurrent GetSession
     fan-out (reuses the favorites.get_favorites pattern).
 
     Each GetSession is independent and read-only, so they run in a small thread
     pool to stay within the request time budget. Order follows ``ids``; any id
     whose detail can't be fetched (error, timeout, or missing session) is
-    skipped, never fabricated.
+    skipped, never fabricated. ``deadline`` (seconds) overrides
+    ``config.SCHEDULE_FETCH_DEADLINE`` so several fan-outs can share one budget.
     """
     if max_details is None:
         max_details = config.MAX_SCHEDULE_DETAILS
@@ -224,7 +227,8 @@ def _resolve_sessions(events, ids: list[str], max_details: Optional[int] = None)
 
     by_id: dict[str, Session] = {}
     workers = min(config.SCHEDULE_FETCH_WORKERS, len(ids))
-    deadline = config.SCHEDULE_FETCH_DEADLINE
+    if deadline is None:
+        deadline = config.SCHEDULE_FETCH_DEADLINE
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
     try:
         futures = {ex.submit(fetch, sid): sid for sid in ids}
@@ -352,6 +356,9 @@ def filter_view_to_date(view: ScheduleView, pacific_date: str) -> ScheduleView:
         reserved=[s for s in view.reserved if on_day_session(s)],
         favorites=[s for s in view.favorites if on_day_session(s)],
         personal_time=[p for p in view.personal_time if on_day_personal(p)],
+        # Keep the completeness marker: if some sessions could not be loaded,
+        # this day may be missing items, and the UI/agent should say so.
+        incomplete=dict(view.incomplete),
     )
 
 
@@ -469,8 +476,16 @@ def build_schedule_view(events, max_details: Optional[int] = None) -> ScheduleVi
     reserved_ids = _extract_session_ids(schedule.get("reserved") or [])
     favorite_ids = _extract_session_ids(schedule.get("favorites") or [])
 
-    reserved = _resolve_sessions(events, reserved_ids, max_details=max_details)
-    favorites = _resolve_sessions(events, favorite_ids, max_details=max_details)
+    # The two fan-outs share ONE time budget. Run back to back with a budget
+    # each, they could add up to twice SCHEDULE_FETCH_DEADLINE and overrun the
+    # Lambda timeout; sharing keeps the whole detail fetch within one deadline.
+    budget = float(config.SCHEDULE_FETCH_DEADLINE)
+    started = time.monotonic()
+    reserved = _resolve_sessions(events, reserved_ids, max_details=max_details,
+                                 deadline=budget)
+    remaining = max(1.0, budget - (time.monotonic() - started))
+    favorites = _resolve_sessions(events, favorite_ids, max_details=max_details,
+                                  deadline=remaining)
 
     personal_time = [
         PersonalTimeEntry.from_mcp(item)
@@ -478,10 +493,20 @@ def build_schedule_view(events, max_details: Optional[int] = None) -> ScheduleVi
         if isinstance(item, dict)
     ]
 
+    # Be explicit when the view is not the whole story: the id arrays from
+    # GetSchedule are the TRUE counts, the resolved sessions may be fewer (size
+    # cap, deadline, or sessions AWS Events lists but cannot return).
+    incomplete: dict = {}
+    if len(reserved) < len(reserved_ids):
+        incomplete["reserved"] = {"loaded": len(reserved), "total": len(reserved_ids)}
+    if len(favorites) < len(favorite_ids):
+        incomplete["favorites"] = {"loaded": len(favorites), "total": len(favorite_ids)}
+
     return ScheduleView(
         reserved=_order(reserved, _session_bounds),
         favorites=_order(favorites, _session_bounds),
         personal_time=_order(personal_time, _personal_bounds),
+        incomplete=incomplete,
     )
 
 

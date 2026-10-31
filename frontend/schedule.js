@@ -288,6 +288,22 @@
     return div;
   }
 
+  // Turn the backend's `incomplete` marker ({kind: {loaded, total}}) into a
+  // sentence, or "" when everything loaded.
+  function describeIncomplete(incomplete) {
+    if (!incomplete || typeof incomplete !== "object") return "";
+    var parts = [];
+    [["reserved", "reserved sessions"], ["favorites", "favorites"]].forEach(function (k) {
+      var inc = incomplete[k[0]];
+      if (inc && typeof inc.total === "number" && inc.total > (inc.loaded || 0)) {
+        parts.push((inc.loaded || 0) + " of " + inc.total + " " + k[1]);
+      }
+    });
+    return parts.length
+      ? "Showing " + parts.join(" and ") + ". The rest couldn't be loaded right now."
+      : "";
+  }
+
   // Render the Schedule_View from a backend GET /schedule response.
   //
   //   data   — parsed response body { reserved, favorites, personalTime, message? }
@@ -326,14 +342,35 @@
       window.Reservations.setReservedIds(reserved.map(function (s) { return s.sessionId; }));
     }
 
+    // Honest completeness: the backend reports, per kind, how many sessions it
+    // listed (total) vs. could load (loaded). A cut-off list must never read as
+    // the whole schedule, and an unloadable one must never read as "empty".
+    var incompleteText = describeIncomplete(data.incomplete);
+
     // Empty-schedule state (Req 17.5, 23.3): no rows at all.
     if (!reserved.length && !favorites.length && !personal.length) {
+      if (incompleteText) {
+        wrap.appendChild(messageBlock(
+          "schedule-error",
+          "Your schedule couldn't be fully loaded.",
+          incompleteText
+        ));
+        return wrap;
+      }
       wrap.appendChild(messageBlock(
         "schedule-empty",
         "Your schedule is empty.",
         "Favorite a session or add a personal time block to see it here."
       ));
       return wrap;
+    }
+
+    if (incompleteText) {
+      var note = document.createElement("p");
+      note.className = "schedule-note";
+      note.setAttribute("role", "status");
+      note.textContent = incompleteText;
+      wrap.appendChild(note);
     }
 
     // Tag each item with exactly one kind, then merge + order chronologically.

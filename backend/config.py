@@ -123,7 +123,7 @@ MAX_FAVORITE_DETAILS: int = int(os.environ.get("MAX_FAVORITE_DETAILS", "100"))
 # GetSession fan-out so a large plan can't blow the agent-turn budget. When
 # a list is longer than this, callers report "showing N of M" rather than
 # implying the shown set is complete.
-MAX_SCHEDULE_DETAILS: int = int(os.environ.get("MAX_SCHEDULE_DETAILS", "30"))
+MAX_SCHEDULE_DETAILS: int = int(os.environ.get("MAX_SCHEDULE_DETAILS", "100"))
 # Concurrency for the GetSession detail fan-out used by the Schedule_View and
 # "show my favorites". Each favorite/reserved id needs its own GetSession; a
 # wider pool means fewer sequential waves and keeps a large plan inside the

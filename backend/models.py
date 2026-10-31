@@ -269,11 +269,20 @@ class ScheduleView:
     reserved: list[Session] = field(default_factory=list)       # reuse Session
     favorites: list[Session] = field(default_factory=list)      # reuse Session
     personal_time: list[PersonalTimeEntry] = field(default_factory=list)
+    # Honest-completeness marker. For each kind ("reserved" / "favorites") whose
+    # session details could not ALL be loaded (size cap, fetch deadline, or
+    # sessions AWS Events lists but cannot return), maps kind -> {"loaded": n,
+    # "total": m}. Empty when everything loaded, so a cut-off list is never
+    # mistaken for the whole schedule.
+    incomplete: dict = field(default_factory=dict)
 
     def to_public_dict(self) -> dict:
         """Serialize for the frontend. Contains no credentials."""
-        return {
+        d = {
             "reserved": [s.to_public_dict() for s in self.reserved],
             "favorites": [s.to_public_dict() for s in self.favorites],
             "personalTime": [p.to_public_dict() for p in self.personal_time],
         }
+        if self.incomplete:
+            d["incomplete"] = {k: dict(v) for k, v in self.incomplete.items()}
+        return d
