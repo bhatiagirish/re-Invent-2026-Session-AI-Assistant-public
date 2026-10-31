@@ -275,6 +275,12 @@ class ScheduleView:
     # "total": m}. Empty when everything loaded, so a cut-off list is never
     # mistaken for the whole schedule.
     incomplete: dict = field(default_factory=dict)
+    # Provenance marker. When some sessions' details came from the catalog index
+    # rather than a live read, maps kind ("reserved" / "favorites") -> how many,
+    # plus "ageSeconds": how old that index is. Empty when everything was read
+    # live. Lets the UI and the assistant say so instead of implying the details
+    # were just re-checked.
+    indexed: dict = field(default_factory=dict)
 
     def to_public_dict(self) -> dict:
         """Serialize for the frontend. Contains no credentials."""
@@ -285,4 +291,6 @@ class ScheduleView:
         }
         if self.incomplete:
             d["incomplete"] = {k: dict(v) for k, v in self.incomplete.items()}
+        if any(self.indexed.get(k) for k in ("reserved", "favorites")):
+            d["indexed"] = dict(self.indexed)
         return d

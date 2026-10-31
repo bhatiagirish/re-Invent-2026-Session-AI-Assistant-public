@@ -7,6 +7,9 @@ reserve seats, and plan your week, all from one chat-style web page.
 It is built on a fully serverless AWS stack and uses an AI agent (Strands
 Agents on Amazon Bedrock) that calls the **AWS Events MCP Server** for all
 session data. The app never invents sessions and keeps no fake local favorites.
+To search all ~2,400 sessions quickly it keeps a refreshed index of the public
+session catalog (see [Catalog index](#catalog-index)); which sessions you
+favorited or reserved, and your personal time, always come live from AWS Events.
 
 > **Single-user by design.** This is a personal app wired to one AWS Events
 > identity. It is not multi-user SaaS: there are no sign-ups, no user accounts
@@ -38,8 +41,9 @@ Ask in plain language, or use the buttons on each session card.
 
 | Capability | Examples |
 |---|---|
-| Search sessions | "Find sessions about Amazon Bedrock", "Beginner serverless workshops" |
+| Search sessions | "Find sessions about Amazon Bedrock", "Beginner serverless workshops" (the whole catalog) |
 | Session details | "Tell me more about #2" |
+| Look up a code | "Tell me more about IND422" (any session code, anywhere in the catalog) |
 | Count and group | "How many sessions about Kiro are on Dec 3?", "Count workshops by venue" |
 | Favorites | "Favorite #2", "Unfavorite it", "Show my favorites" (star button on cards) |
 | Reservations | "Reserve #3", "Cancel that reservation" (Reserve button on cards, "My Reservations" view) |
@@ -86,7 +90,9 @@ flowchart TD
 3. The agent sends your message to Claude on Amazon Bedrock. The model decides
    which tool to call; there is no hard-coded keyword mapping.
 4. Tools call the AWS Events MCP Server, the single source of truth for session
-   data, favorites, schedule, personal time and reservations.
+   data, favorites, schedule, personal time and reservations. Searches, counts
+   and code lookups first consult the [catalog index](#catalog-index) to find
+   matches, then re-read the sessions they show live.
 5. The backend returns a natural-language message **plus** a structured list of
    sessions taken from real MCP results, never parsed out of the model's text.
    The UI renders the cards from that structured list.
@@ -95,13 +101,42 @@ flowchart TD
 
 | Tool | Purpose |
 |---|---|
-| `search_sessions` | Find sessions by topic, level, type or date |
+| `search_sessions` | Find sessions by topic, level, type or date, across the whole catalog |
 | `get_session_details` | Full details for one session (resolves "#2" references) |
+| `find_session_by_code` | Find one session by its code (for example `IND422`), wherever it is in the catalog |
 | `count_sessions` | Counts across the catalog, favorites or reservations, grouped by date, venue, topic or type |
 | `favorite_session`, `unfavorite_session`, `show_favorites` | Manage favorites |
 | `show_schedule`, `find_schedule_conflicts` | View the schedule and detect overlaps |
 | `add_personal_time`, `update_personal_time`, `delete_personal_time` | Manage personal calendar blocks |
-| `reserve_session`, `cancel_reservation` | Manage seat reservations (only when reservations are enabled) |
+| `show_reservations`, `reserve_session`, `cancel_reservation` | List, reserve and cancel seats (only when reservations are enabled) |
+
+### Catalog index
+
+AWS Events' `ListSessions` returns the catalog only in pages (250 sessions per
+page, about 2,400 in all), with no search or filter, and reading every page
+takes longer than one chat turn. So the backend keeps a compact **index of the
+public session catalog** in DynamoDB:
+
+- **Built in the background.** After you connect, the page asks the backend to
+  build or check the index (`POST /catalog/warm`), a bounded step at a time. It
+  never blocks the chat.
+- **Used to find, not to show.** The index decides which sessions match a
+  search, a count or a session code. The sessions shown to you are re-read live
+  from AWS Events, so room, time and availability are current, and a session
+  that no longer exists is left out.
+- **Favorites in the schedule.** To keep a long favorites list fast, favorites'
+  details in **My Schedule** come from the index, labelled "Favorite details as
+  of N min ago". Reserved sessions are always re-read live, and which sessions
+  are on your schedule always comes live from AWS Events.
+- **Kept fresh.** The catalog size is re-checked about every 15 minutes and the
+  index is rebuilt about every hour while you are connected; the old index keeps
+  serving until the new one is ready. An index older than 6 hours is not used.
+- **Honest about coverage.** Search and count results say what they covered.
+  Until the index is ready, search falls back to the first part of the catalog
+  and says so. Right after a fresh deploy, **My Schedule** shows "Preparing your
+  schedule…" for up to about a minute while the index is built.
+
+Your favorites, reservations, schedule and personal time are never cached.
 
 ### Conversation memory
 
@@ -133,7 +168,7 @@ IANA time zone rules, and validates input before any MCP call.
 | Amazon API Gateway (HTTP API) | Front door for the backend, routed under the same CloudFront domain |
 | AWS Lambda (Python 3.12, arm64) | Backend routing, auth and agent orchestration |
 | Amazon Bedrock | Claude Haiku 4.5 for natural-language understanding |
-| Amazon DynamoDB | App session, conversation context and history (TTL-expired) |
+| Amazon DynamoDB | App session, conversation context and history, and the catalog search index (all TTL-expired) |
 | AWS Secrets Manager | Admin key and server-side refresh token |
 | AWS KMS | Encrypts cached access tokens |
 | Amazon CloudWatch | Structured logs (tokens are never logged) |
@@ -151,13 +186,19 @@ External dependency: the **AWS Events MCP Server** (`https://api.awsevents.com/m
 - State-changing requests require the session cookie and a CSRF token.
 - CORS is restricted to the CloudFront origin, and IAM is least-privilege
   (one table, one KMS key, scoped secrets, `bedrock:InvokeModel`).
+- Only the public session catalog is cached (the search index). Your favorites,
+  reservations, schedule and personal time are read from AWS Events on demand
+  and never stored.
+- Every AWS Events call has a time limit (about 10 seconds), so a slow call fails
+  cleanly and can be retried instead of holding a request open.
 
 ## Project structure
 
 ```text
-backend/    Lambda code: app, agent, MCP client, favorites, schedule,
-            reservations, session manager, auth, models, config
+backend/    Lambda code: app, agent, MCP client, catalog index, favorites,
+            schedule, reservations, session manager, auth, models, config
 frontend/   Static site: HTML, CSS and vanilla JavaScript (no build step)
+            demo/  the sample-data demo published on GitHub Pages
 infra/      template.yaml (AWS SAM)
 ```
 
@@ -248,7 +289,7 @@ Set `ReservationsEnabled="false"` to turn the reservation feature off.
 on the same CloudFront domain. No edit is needed.
 
 ```bash
-aws s3 sync frontend "s3://$BUCKET/" --delete --region "$AWS_REGION"
+aws s3 sync frontend "s3://$BUCKET/" --delete --exclude "tests/*" --region "$AWS_REGION"
 
 DOMAIN="${SITE_URL#https://}"
 DIST_ID="$(aws cloudfront list-distributions \
@@ -281,6 +322,10 @@ python docs/spikes/connect.py
    one-time link of the form `https://<your-cloudfront-domain>/#connect=<code>`.
 4. Open that link within about two minutes. The page shows **Connected**.
 5. Start asking: "Find sessions about Bedrock", "Favorite #2", "Show my schedule".
+
+On the first visit after a deploy, the page builds the catalog index in the
+background, which takes about a minute. Until then a search says it covered only
+part of the catalog, and **My Schedule** shows "Preparing your schedule…".
 
 If the page shows "not authorized", the identity you signed in with is not
 registered for re:Invent 2026.
@@ -320,13 +365,17 @@ aws cloudformation describe-stacks --stack-name "$STACK" --region "$AWS_REGION"
 The KMS key is scheduled for deletion with a waiting period (about 7 to 30 days)
 by AWS design, at a cost of cents.
 
-
 ## Limitations
 
 - Single user only; one AWS Events identity per deployment.
 - The app session lasts about an hour (token lifetime); reconnect as needed.
-- Session data comes entirely from the AWS Events MCP Server. If the 2026
-  catalog is empty or inactive, searches return nothing and the "My
-  Reservations" list can appear empty even when seats are held, because
-  reserved IDs that cannot be resolved to session details are omitted rather
-  than fabricated.
+- Favorites' details in **My Schedule** come from the catalog index and can be up
+  to about an hour old. Reserved sessions and the sessions shown in search
+  results are re-read live.
+- The index can only be refreshed while you are connected, because it uses your
+  AWS Events sign-in. After a long break, the first minute can show partial
+  search results and "Preparing your schedule…".
+- AWS Events calls are occasionally slow. Each call is time-limited and the
+  schedule retries automatically; if it still fails, use **Try again**.
+- The app never fabricates sessions: a session AWS Events cannot return is left
+  out and reported (for example, "Showing 68 of 70 favorites").

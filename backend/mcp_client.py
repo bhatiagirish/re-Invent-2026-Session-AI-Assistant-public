@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import threading
 import time
 from typing import Callable, Optional
 
@@ -33,6 +34,15 @@ from models import Session
 
 class McpAuthExpired(Exception):
     """Raised when the MCP server rejects the bearer token (401/expired)."""
+
+
+def _as_count(value) -> Optional[int]:
+    """A catalog size from a tool payload (int or numeric string), else None."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 0 else None
 
 
 def _looks_like_auth_error(exc: Exception) -> bool:
@@ -163,6 +173,11 @@ class EventsClient:
 
     def __init__(self, access_token: str, client_factory=None, call_timeout: Optional[int] = None):
         self._access_token = access_token
+        # The catalog size AWS Events reported on the most recent ListSessions
+        # page (its `totalCount`), or None. Used to describe search coverage and
+        # to cheaply detect that the catalog changed.
+        self.last_total_count: Optional[int] = None
+        self._listing_tried = False
         self._factory = client_factory or make_mcp_client
         self._timeout = call_timeout or config.MCP_CALL_TIMEOUT
         self._tool_map: dict[str, str] = {}
@@ -175,11 +190,16 @@ class EventsClient:
         Lambda containers. This avoids an extra `list_tools()` MCP round trip on
         every request. The per-user bearer token is NEVER cached — only names.
         """
-        if self._tool_map:
+        if self._tool_map or self._listing_tried:
             return
         if _server_tool_names:
             self._tool_map = dict(_server_tool_names)
             return
+        # Try the listing ONCE per client. If it fails or hangs, the default tool
+        # names are used for the rest of the request; retrying it before every
+        # call (the schedule view makes ~80) would multiply a hung listing's
+        # timeout across all of them.
+        self._listing_tried = True
         try:
             names = self.list_tools()
         except Exception:
@@ -220,10 +240,19 @@ class EventsClient:
                 _raise_if_tool_error(tool_name, result)
                 return _extract_tool_json(result)
 
+        # NOTE: do NOT use `with ThreadPoolExecutor(...)` here. Leaving the `with`
+        # block calls shutdown(wait=True), which waits for the worker to FINISH
+        # even after result(timeout=...) has raised -- so a hung MCP call was
+        # never actually bounded and ran until Lambda killed the request at 29 s.
+        # shutdown(wait=False) returns immediately; the stuck worker is left to
+        # finish (or be frozen with the container) without holding the request.
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            try:
                 future = ex.submit(run)
                 return future.result(timeout=self._timeout)
+            finally:
+                ex.shutdown(wait=False, cancel_futures=True)
         except concurrent.futures.TimeoutError:
             raise McpTimeoutError(f"{tool_name} timed out") from None
         except (McpAuthExpired, EventAccessDeniedError, McpError,
@@ -266,7 +295,12 @@ class EventsClient:
         the same typed exceptions as every other call.
         """
         tool_name = self._resolve_tool("list_sessions")
-        state = {"pages": 0, "token": next_token, "stopped": "budget"}
+        state = {"pages": 0, "token": next_token, "stopped": "budget",
+                 "abandoned": False}
+        # `on_page` plus the (pages, token) advance happen under this lock, so
+        # when the outer timeout fires the saved resume position always matches
+        # exactly the pages `on_page` has processed -- never a page more or less.
+        lock = threading.Lock()
 
         def run() -> None:
             client = self._factory(self._access_token)
@@ -283,18 +317,23 @@ class EventsClient:
                     )
                     _raise_if_tool_error(tool_name, result)
                     data = _extract_tool_json(result)
+                    self._note_total(data)
                     page = [Session.from_mcp(i) for i in data.get("items", [])]
-                    state["pages"] += 1
-                    state["token"] = data.get("nextToken")
-                    if on_page(page):
-                        state["stopped"] = "found"
-                        return
-                    if not state["token"]:
-                        state["stopped"] = "end"
-                        return
-                    if state["pages"] >= max_pages:
-                        state["stopped"] = "cap"
-                        return
+                    with lock:
+                        if state["abandoned"]:
+                            return               # caller already gave up on us
+                        stop = on_page(page)
+                        state["pages"] += 1
+                        state["token"] = data.get("nextToken")
+                        if stop:
+                            state["stopped"] = "found"
+                            return
+                        if not state["token"]:
+                            state["stopped"] = "end"
+                            return
+                        if state["pages"] >= max_pages:
+                            state["stopped"] = "cap"
+                            return
                     if time.monotonic() > deadline:
                         state["stopped"] = "budget"
                         return
@@ -308,9 +347,16 @@ class EventsClient:
             try:
                 future.result(timeout=outer)
             except concurrent.futures.TimeoutError:
-                # Keep whatever pages were read; the caller treats this as a
-                # budget stop and can resume from state["token"].
-                state["stopped"] = "budget"
+                # Keep whatever pages were fully processed; the caller treats
+                # this as a budget stop and can resume from state["token"]. Wait
+                # for any in-flight on_page, then forbid further pages.
+                got = lock.acquire(timeout=5)
+                try:
+                    state["abandoned"] = True
+                    state["stopped"] = "budget"
+                finally:
+                    if got:
+                        lock.release()
             except (McpAuthExpired, EventAccessDeniedError, McpError,
                     McpUnavailableError, McpTimeoutError):
                 raise
@@ -332,9 +378,12 @@ class EventsClient:
                         names.append(name)
                 return names
 
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            try:
                 return ex.submit(run).result(timeout=self._timeout)
+            finally:
+                ex.shutdown(wait=False, cancel_futures=True)   # see _call_tool
         except concurrent.futures.TimeoutError:
             raise McpTimeoutError("list_tools timed out") from None
         except Exception as exc:
@@ -352,8 +401,16 @@ class EventsClient:
         if next_token:
             args["nextToken"] = next_token
         data = self._call_tool(self._resolve_tool("list_sessions"), args)
+        self._note_total(data)
         items = [Session.from_mcp(i) for i in data.get("items", [])]
         return items, data.get("nextToken")
+
+    def _note_total(self, data: dict) -> None:
+        """Remember the catalog size reported on a ListSessions page (never
+        overwrite a known value with 'unknown')."""
+        total = _as_count(data.get("totalCount"))
+        if total is not None:
+            self.last_total_count = total
 
     def get_session(self, session_id: str, locale: Optional[str] = None) -> Optional[Session]:
         args: dict = {"eventId": self.EVENT_ID, "sessionId": session_id}

@@ -33,11 +33,12 @@ from auth import (
     generate_state,
 )
 from errors import AppError, AuthFailedError, AuthRequiredError, InvalidRequestError
-from logging_utils import Timer, log_event
+from logging_utils import Timer, log_event, safe_text
 from mcp_client import EventsClient, McpAuthExpired, determine_registration
 from models import ActionResult, AuthState, ChatRequest, ChatResponse, Session, TokenBundle
 from session_manager import SessionManager
 import agent as agent_mod
+import catalog_cache
 import favorites as fav
 import reservations as resv
 import schedule as sched
@@ -446,7 +447,7 @@ def chat(event: dict) -> dict:
     def build_and_run(token: str) -> str:
         events = EventsClient(token)
         agent = agent_mod.build_agent(events, recorder, resolve_reference=_resolver,
-                                      history=history)
+                                      history=history, catalog=_catalog_cache(sm))
         prompt = req.message
         if resolved_id:
             # Give the agent the resolved target explicitly (still its choice to
@@ -587,11 +588,12 @@ def get_favorite_ids(event: dict) -> dict:
 
 def _favorites_with_retry(sm: SessionManager, app_session_id: str):
     events = _events_for(sm, app_session_id)
+    catalog = _catalog_cache(sm)
     try:
-        return fav.get_favorites(events)
+        return fav.get_favorites(events, catalog=catalog)
     except McpAuthExpired:
         events2 = EventsClient(sm.get_valid_access_token(app_session_id, skew_seconds=10_000))
-        return fav.get_favorites(events2)
+        return fav.get_favorites(events2, catalog=catalog)
 
 
 def post_favorite(event: dict) -> dict:
@@ -772,22 +774,65 @@ def get_schedule(event: dict) -> dict:
         view = _schedule_with_retry(sm, app_session_id)
     except McpAuthExpired:
         raise AuthRequiredError()
-    except McpTimeoutError:
+    except McpTimeoutError as exc:
+        _log_soft_failure(event, "GET /schedule", exc)
         return _json_response(504, {"reserved": [], "favorites": [], "personalTime": [],
                                     "message": "That took too long. Please try again."})
-    except (McpUnavailableError, McpError):
+    except (McpUnavailableError, McpError) as exc:
+        _log_soft_failure(event, "GET /schedule", exc)
         return _json_response(200, {"reserved": [], "favorites": [], "personalTime": [],
                                     "message": "I couldn't retrieve your schedule right now. Please try again."})
     return _json_response(200, view.to_public_dict())
 
 
+def _log_soft_failure(event: dict, operation: str, exc: Exception) -> None:
+    """Record WHY a request degraded to a friendly message. Those responses are
+    returned (not raised), so the dispatcher's log line would otherwise call them
+    successes and the cause would be invisible in CloudWatch."""
+    # The typed MCP errors are raised "from" the original transport/SDK error;
+    # that original is the real reason (HTTP 429, connection reset, ...).
+    cause = exc.__cause__ or exc.__context__
+    extra = {"degraded": True, "exception": type(exc).__name__,
+             "message": safe_text(exc)}
+    if cause is not None:
+        extra["cause"] = safe_text(f"{type(cause).__name__}: {cause}")
+    log_event(request_id=_request_id(event), operation=operation, success=False,
+              error_category=getattr(exc, "category", type(exc).__name__),
+              session_id=_get_cookie(event, config.COOKIE_NAME), extra=extra)
+
+
+_MIN_RETRY_BUDGET_SECONDS = 8.0
+
+
+def _build_view_with_transient_retry(events, catalog=None):
+    """Build the schedule view within the whole-request budget. If AWS Events
+    fails (unavailable, a tool error, or a call that timed out), try once more
+    -- but only when enough of the budget is left for the retry to have a real
+    chance. The retry is given only what remains, so the two attempts together
+    can never run past the Lambda limit (the old code could, and was killed at
+    29 s with a 500)."""
+    budget = float(config.SCHEDULE_REQUEST_BUDGET_SECONDS)
+    started = time.monotonic()
+    try:
+        return sched.build_schedule_view(events, time_budget=budget, catalog=catalog)
+    except (McpUnavailableError, McpError, McpTimeoutError) as first:
+        left = budget - (time.monotonic() - started)
+        if left < _MIN_RETRY_BUDGET_SECONDS:
+            raise
+        if not isinstance(first, McpTimeoutError):
+            time.sleep(1.0)               # let a brief outage / throttle pass
+            left -= 1.0
+        return sched.build_schedule_view(events, time_budget=left, catalog=catalog)
+
+
 def _schedule_with_retry(sm: SessionManager, app_session_id: str):
     events = _events_for(sm, app_session_id)
+    catalog = _catalog_cache(sm)
     try:
-        return sched.build_schedule_view(events)
+        return _build_view_with_transient_retry(events, catalog=catalog)
     except McpAuthExpired:
         events2 = EventsClient(sm.get_valid_access_token(app_session_id, skew_seconds=10_000))
-        return sched.build_schedule_view(events2)
+        return _build_view_with_transient_retry(events2, catalog=catalog)
 
 
 def post_personal_time(event: dict) -> dict:
@@ -860,6 +905,58 @@ def _personal_time_with_retry(sm: SessionManager, app_session_id: str, call):
         return call(events2)
 
 
+# ── Catalog index (search over the whole catalog) ────────────────────────────
+def _catalog_cache(sm: SessionManager):
+    """The catalog index cache, or None when the feature is switched off."""
+    if not config.CATALOG_CACHE_ENABLED:
+        return None
+    return catalog_cache.CatalogCache(sm.ddb)
+
+
+def post_catalog_warm(event: dict) -> dict:
+    """POST /catalog/warm -- advance (or verify) the catalog index.
+
+    The page calls this in the background after load, repeatedly, until the index
+    reports ``ready``. Each call does a bounded amount of work and saves its
+    progress, so a build finishes across a few calls and never eats into a chat
+    turn. Requires an authorized session and CSRF (it makes MCP calls and writes
+    to DynamoDB). It exposes no session data: only counts and ages.
+    """
+    sm, app_session_id, sess = _authorized_session_or_raise(event)
+    _require_csrf(event, sess)
+    cache = _catalog_cache(sm)
+    if cache is None:
+        return _json_response(200, {"enabled": False, "ready": False})
+
+    def run(token: str) -> dict:
+        return cache.warm(EventsClient(token))
+
+    try:
+        try:
+            status = run(sm.get_valid_access_token(app_session_id))
+        except McpAuthExpired:
+            status = run(sm.get_valid_access_token(app_session_id, skew_seconds=10_000))
+    except McpAuthExpired:
+        raise AuthRequiredError()
+    except (McpTimeoutError, McpUnavailableError, McpError) as exc:
+        # Progress already saved stays; report where things stand and let the
+        # caller try again later. Search keeps working in its fallback mode.
+        # This is returned as a 200, so record the cause explicitly (otherwise
+        # the request log calls it a success and the reason is lost).
+        _log_soft_failure(event, "POST /catalog/warm", exc)
+        status = cache.status()
+        status["error"] = True
+    # One line per warm call showing where the build stands, so the logs show
+    # exactly when the index became ready relative to other requests.
+    log_event(request_id=_request_id(event), operation="catalog/warm_status",
+              success=not status.get("error"),
+              session_id=_get_cookie(event, config.COOKIE_NAME),
+              extra={k: status.get(k) for k in ("ready", "building", "pagesBuilt",
+                                               "sessions", "ageSeconds", "error")
+                     if k in status})
+    return _json_response(200, status)
+
+
 # ── Dispatch ─────────────────────────────────────────────────────────────────
 _ROUTES = {
     ("GET", "/auth/login"): auth_login,
@@ -869,6 +966,7 @@ _ROUTES = {
     ("POST", "/chat"): chat,
     ("POST", "/admin/connect"): admin_connect,
     ("POST", "/admin/claim"): admin_claim,
+    ("POST", "/catalog/warm"): post_catalog_warm,
     ("GET", "/favorites"): get_favorites,
     ("GET", "/favorites/ids"): get_favorite_ids,
     ("POST", "/favorites"): post_favorite,
@@ -933,9 +1031,16 @@ def lambda_handler(event: dict, context=None) -> dict:
     with Timer() as timer:
         try:
             resp = handler(event, path_arg) if path_arg is not None else handler(event)
-            log_event(request_id=request_id, operation=operation, success=True,
+            # Record the HTTP status too: a handler can return a 5xx (e.g. a
+            # timeout mapped to 504) without raising, which is otherwise
+            # indistinguishable from success in the logs. (Key is "status", not
+            # "statusCode": the scrubber redacts any key containing "code".)
+            status = resp.get("statusCode") if isinstance(resp, dict) else None
+            log_event(request_id=request_id, operation=operation,
+                      success=not (isinstance(status, int) and status >= 500),
                       duration_ms=timer.duration_ms,
-                      session_id=_get_cookie(event, config.COOKIE_NAME))
+                      session_id=_get_cookie(event, config.COOKIE_NAME),
+                      extra={"status": status})
             return resp
         except AppError as e:
             log_event(request_id=request_id, operation=operation, success=False,

@@ -63,6 +63,8 @@
       if (window.Reservations && window.Reservations.enabled && window.Reservations.enabled()) {
         window.Reservations.loadReservedIds();
       }
+      // Build the catalog search index in the background (never blocks chat).
+      if (window.Catalog) window.Catalog.start();
     }
 
     // Surface a post-login auth error passed back via ?auth_error=1.

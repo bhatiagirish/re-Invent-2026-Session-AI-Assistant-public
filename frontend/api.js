@@ -74,6 +74,10 @@
     // The two GET reads are read-only (no CSRF; cookie via credentials:"include"),
     // mirroring getFavorites/favoriteIds; reserve/cancelReservation are
     // state-changing, so request() carries the X-CSRF-Token header.
+    // Catalog index (search over the whole catalog). Builds the index in bounded
+    // steps; call again until the response says ready. Makes MCP calls and
+    // writes the index, so it is state-changing (carries X-CSRF-Token).
+    warmCatalog: () => request("POST", "/catalog/warm"),
     getReservations: () => request("GET", "/reservations"),
     reservedIds: () => request("GET", "/reservations/ids"),
     reserve: (sessionId) => request("POST", "/reservations", { sessionId }),

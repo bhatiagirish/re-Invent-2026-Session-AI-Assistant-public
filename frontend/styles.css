@@ -284,6 +284,9 @@ body {
 .schedule-state.schedule-error { background: #fdecea; border-color: #f5c6c0; }
 .schedule-state.schedule-error .schedule-state-title { color: var(--err); }
 
+/* Quiet provenance line: favorite details came from the catalog index. */
+.schedule-source { margin: 0 0 10px; font-size: .8rem; color: var(--ink-soft); }
+
 /* Shown above a schedule that is not complete (cap, deadline, or unloadable
    sessions), so a cut-off list is never mistaken for the whole schedule. */
 .schedule-note {

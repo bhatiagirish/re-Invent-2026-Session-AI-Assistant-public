@@ -38,6 +38,39 @@ def anonymize(value: Optional[str]) -> Optional[str]:
     return "sid_" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
 
+def log_fetch_summary(operation: str, requested: int, resolved: int,
+                      pending: int, errors: dict) -> None:
+    """One log line for a batch of per-session reads (the GetSession fan-out).
+
+    Those reads swallow individual failures by design (a missing detail must not
+    sink the whole page), which also made them invisible. This records how many
+    were asked for, how many came back, how many were still running when the
+    deadline hit, and the error types seen, so throttling or timeouts show up.
+    """
+    log_event(request_id=None, operation=operation,
+              success=(resolved == requested), error_category=None,
+              extra={"requested": requested, "resolved": resolved,
+                     "pendingAtDeadline": pending, "errors": dict(errors)})
+
+
+_BEARER = re.compile(r"(?i)bearer\s+\S+")
+_JWT = re.compile(r"eyJ[A-Za-z0-9_\-]{8,}(?:\.[A-Za-z0-9_\-]+){0,2}")
+_LONG_SECRETISH = re.compile(r"[A-Za-z0-9_\-]{40,}")
+
+
+def safe_text(text: Any, limit: int = 200) -> str:
+    """A short, log-safe rendering of an error message: strips bearer values,
+    JWT-looking strings and other long opaque tokens, then truncates. Used to
+    record WHY a call failed (for example an HTTP 429 or a connection error)
+    without ever risking a credential in the logs."""
+    s = str(text)
+    s = _BEARER.sub("Bearer [REDACTED]", s)
+    s = _JWT.sub("[REDACTED]", s)
+    s = _LONG_SECRETISH.sub("[REDACTED]", s)
+    s = " ".join(s.split())
+    return s[:limit] + ("…" if len(s) > limit else "")
+
+
 def _scrub(obj: Any) -> Any:
     """Recursively drop values whose key looks secret; truncate long strings."""
     if isinstance(obj, dict):
@@ -85,8 +118,17 @@ class Timer:
 
     def __enter__(self) -> "Timer":
         self._start = time.perf_counter()
-        self.duration_ms = 0.0
+        self._end: Optional[float] = None
         return self
 
     def __exit__(self, *exc) -> None:
-        self.duration_ms = (time.perf_counter() - self._start) * 1000.0
+        self._end = time.perf_counter()
+
+    @property
+    def duration_ms(self) -> float:
+        """Elapsed milliseconds: live while the block is running, fixed once it
+        has exited. (It used to be set only on exit, but the request logger reads
+        it INSIDE the block, so every request logged 0.0 and timeouts could not
+        be spotted in the logs.)"""
+        end = self._end if self._end is not None else time.perf_counter()
+        return (end - self._start) * 1000.0

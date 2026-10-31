@@ -20,7 +20,7 @@ from errors import (
     McpUnavailableError,
 )
 import config
-from logging_utils import log_event
+from logging_utils import log_event, log_fetch_summary
 from mcp_client import EventsClient, McpAuthExpired
 from models import ActionResult, Session
 
@@ -139,6 +139,7 @@ def resolve_sessions_with_total(events: EventsClient, ids: list[str],
         return [], total
 
     auth_expired: list[McpAuthExpired] = []
+    errors: dict = {}          # error type -> count, for the fetch summary log
 
     def fetch(sid: str):
         try:
@@ -146,10 +147,12 @@ def resolve_sessions_with_total(events: EventsClient, ids: list[str],
         except McpAuthExpired as exc:
             auth_expired.append(exc)
             return sid, None
-        except (McpError, McpTimeoutError, McpUnavailableError):
+        except (McpError, McpTimeoutError, McpUnavailableError) as exc:
+            errors[type(exc).__name__] = errors.get(type(exc).__name__, 0) + 1
             return sid, None
 
     by_id: dict = {}
+    done = 0
     workers = min(config.SCHEDULE_FETCH_WORKERS, len(capped))
     # Overall deadline (config.SCHEDULE_FETCH_DEADLINE): collect whatever has
     # resolved in time and skip stragglers (never fabricated) instead of letting
@@ -162,16 +165,49 @@ def resolve_sessions_with_total(events: EventsClient, ids: list[str],
             for fut in concurrent.futures.as_completed(
                     futures, timeout=config.SCHEDULE_FETCH_DEADLINE):
                 sid, sess = fut.result()
+                done += 1
                 if sess:
                     by_id[sid] = sess
         except concurrent.futures.TimeoutError:
             pass
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
+    log_fetch_summary("favorites/detail_fetch", len(capped), len(by_id),
+                      len(capped) - done, errors)
     if auth_expired:
         raise auth_expired[0]
     # Preserve the original id ordering; omit un-fetchable ids (no fabrication).
     return [by_id[sid] for sid in capped if sid in by_id], total
+
+
+def resolve_sessions_indexed(events: EventsClient, ids: list[str], snapshot,
+                             max_details: Optional[int] = None
+                             ) -> tuple[list[Session], int, int]:
+    """Resolve ids to Session details, taking them from the catalog index first.
+
+    Only ids MISSING from the index are read live from AWS Events. This avoids
+    the per-session GetSession fan-out (one fresh connection each) that made the
+    schedule take 16-20 s and show "51 of 70". With ``snapshot=None`` it is the
+    live fan-out, unchanged.
+
+    Returns ``(sessions, total, indexed)``: sessions in the order of `ids`, the
+    TRUE number of ids, and how many details came from the index (so the caller
+    can say how old they may be). Nothing is fabricated: an id found neither in
+    the index nor live is omitted.
+    """
+    if snapshot is None:
+        sessions, total = resolve_sessions_with_total(events, ids, max_details=max_details)
+        return sessions, total, 0
+    by_id = {s.session_id: s for s in snapshot.sessions}
+    from_index = {sid: by_id[sid] for sid in ids if sid in by_id}
+    missing = [sid for sid in ids if sid not in from_index]
+    found = dict(from_index)
+    if missing:
+        live, _ = resolve_sessions_with_total(events, missing, max_details=max_details)
+        for s in live:
+            found[s.session_id] = s
+    ordered = [found[sid] for sid in ids if sid in found]
+    return ordered, len(ids), len(from_index)
 
 
 def extract_session_ids(entries) -> list[str]:
@@ -214,7 +250,8 @@ def get_favorite_ids(events: EventsClient) -> list[str]:
 
 
 def get_favorites(events: EventsClient,
-                  max_details: Optional[int] = None) -> list[Session]:
+                  max_details: Optional[int] = None,
+                  catalog=None) -> list[Session]:
     """Return the user's favorites as full Session objects.
 
     Fetches favorite ids from GetSchedule, then GetSession for each. The detail
@@ -228,12 +265,14 @@ def get_favorites(events: EventsClient,
     favorites list is shown in full. Use :func:`get_favorites_with_total` when
     you need the true favorite count to report truncation honestly.
     """
-    sessions, _total = get_favorites_with_total(events, max_details=max_details)
+    sessions, _total = get_favorites_with_total(events, max_details=max_details,
+                                                catalog=catalog)
     return sessions
 
 
 def get_favorites_with_total(events: EventsClient,
-                             max_details: Optional[int] = None
+                             max_details: Optional[int] = None,
+                             catalog=None, stats: Optional[dict] = None
                              ) -> tuple[list[Session], int]:
     """Like :func:`get_favorites`, but also return the TRUE number of favorites
     (the full id count from GetSchedule), independent of how many were resolved
@@ -244,6 +283,19 @@ def get_favorites_with_total(events: EventsClient,
     the ordered id->Session detail fan-out to the shared
     :func:`resolve_sessions_with_total` helper so favorites and reservations
     share one bounded-concurrency implementation.
+
+    With a ``catalog`` (and ``config.FAVORITE_DETAILS_FROM_INDEX`` on) the details
+    come from the catalog index, so a long favorites list needs no per-session
+    AWS Events calls. If ``stats`` is given it is filled with ``indexed`` (how
+    many details came from the index) and ``age_text`` (how old the index is).
     """
     all_ids = get_favorite_ids(events)
-    return resolve_sessions_with_total(events, all_ids, max_details=max_details)
+    snap = catalog.load_ready() if (catalog is not None and
+                                    config.FAVORITE_DETAILS_FROM_INDEX) else None
+    sessions, total, indexed = resolve_sessions_indexed(events, all_ids, snap,
+                                                        max_details=max_details)
+    if stats is not None:
+        stats["indexed"] = indexed
+        stats["age_text"] = snap.age_text if snap is not None else ""
+        stats["age_seconds"] = snap.age_seconds if snap is not None else 0
+    return sessions, total

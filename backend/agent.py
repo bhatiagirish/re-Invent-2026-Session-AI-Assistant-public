@@ -31,6 +31,7 @@ from errors import McpError, McpTimeoutError, McpUnavailableError, ValidationErr
 from logging_utils import log_event
 from mcp_client import EventsClient, McpAuthExpired
 from models import ActionResult, ScheduleView, Session
+import catalog_cache
 import favorites as fav
 import reservations as resv
 import schedule as sched
@@ -151,6 +152,12 @@ seat). Personal-time start/end are Pacific event-local; only confirm a \
 create/update/delete AFTER the tool reports success, and if validation fails \
 report the specific problem the tool names.
 <<RESERVATION_RULES>>
+- Search and count results end with a COVERAGE line saying how much of the \
+catalog was searched. If it says PARTIAL, or says sessions were left out or \
+could not be re-checked, tell the user so in one short sentence. When it says \
+all sessions were searched, do NOT repeat the coverage details; if the user asks \
+how fresh the data is, say the search index was built the stated time ago and \
+the sessions shown were re-checked live.
 - Keep answers concise and useful. When you list sessions, refer to them by \
 their position (1, 2, 3, ...) and session code so the user can follow up.
 - If a tool returns no matching sessions, say so plainly and suggest a broader \
@@ -254,25 +261,142 @@ class SessionRecorder:
         self.action = result
 
 
-def _search_sessions_impl(events: EventsClient, recorder: SessionRecorder,
-                          query: str, limit: int) -> str:
-    """Walk paginated ListSessions, filter by relevance, cap results.
+def _rank(sessions: list[Session], terms: list[str]) -> list[Session]:
+    """Sessions that match `terms` (same membership rule as `_relevant`), best
+    first: a term in the title outranks one in services/topics/features, which
+    outranks one anywhere else. Ties keep catalog order. With no meaningful term
+    every session matches and catalog order is kept."""
+    meaningful = [t for t in terms if t not in _STOPWORDS]
+    if not meaningful:
+        return list(sessions)
+    scored = []
+    for idx, s in enumerate(sessions):
+        title = (s.title or "").lower()
+        tags = " ".join(list(s.services) + list(s.topics) + list(s.features)).lower()
+        hay = " ".join([s.title or "", s.type or "", s.level or "", tags,
+                        s.abbreviation or ""]).lower()
+        score = 0
+        for t in meaningful:
+            if t in title:
+                score += 3
+            elif t in tags:
+                score += 2
+            elif t in hay:
+                score += 1
+        if score:
+            scored.append((-score, idx, s))
+    scored.sort(key=lambda x: (x[0], x[1]))
+    return [s for _, _, s in scored]
 
-    Pagination strategy (Req 10): fetch up to MAX_LIST_PAGES pages, stop early
-    once we have enough relevant matches or run out of pages. We do NOT pull the
-    entire ~2000-session catalog for every request.
+
+def _live_refresh(events: EventsClient, sessions: list[Session]
+                  ) -> tuple[list[Session], int, int]:
+    """Re-read each session live from AWS Events (details such as room, time and
+    availability can change after the index was built).
+
+    Returns ``(sessions, gone, unverified)``: live versions where the re-read
+    worked; sessions AWS Events no longer has are LEFT OUT (`gone`); sessions
+    whose re-read failed or timed out keep their indexed details (`unverified`)
+    and the caller says so. An expired token is re-raised.
+    """
+    if not sessions:
+        return [], 0, 0
+    auth_expired: list[McpAuthExpired] = []
+
+    def fetch(s: Session):
+        try:
+            live = events.get_session(s.session_id)
+        except McpAuthExpired as exc:
+            auth_expired.append(exc)
+            return s.session_id, ("error", None)
+        except (McpError, McpTimeoutError, McpUnavailableError):
+            return s.session_id, ("error", None)
+        return s.session_id, (("ok", live) if live else ("gone", None))
+
+    results: dict = {}
+    workers = max(1, min(config.SCHEDULE_FETCH_WORKERS, len(sessions)))
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = [ex.submit(fetch, s) for s in sessions]
+        try:
+            for fut in concurrent.futures.as_completed(
+                    futures, timeout=config.CATALOG_LIVE_REFRESH_DEADLINE):
+                sid, res = fut.result()
+                results[sid] = res
+        except concurrent.futures.TimeoutError:
+            pass
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    if auth_expired:
+        raise auth_expired[0]
+
+    out: list[Session] = []
+    gone = unverified = 0
+    for s in sessions:
+        kind, live = results.get(s.session_id, ("error", None))
+        if kind == "ok":
+            out.append(live)
+        elif kind == "gone":
+            gone += 1
+        else:
+            out.append(s)
+            unverified += 1
+    return out, gone, unverified
+
+
+def _index_coverage(snap, matched: int, shown: int, gone: int, unverified: int) -> str:
+    """One line telling the model (and so the user) exactly what was searched."""
+    indexed = len(snap.sessions)
+    scope = f"all {indexed}" if snap.total_count <= indexed else \
+        f"{indexed} of {snap.total_count}"
+    line = (f"COVERAGE: searched {scope} sessions in the catalog index (built "
+            f"{snap.age_text} ago); {matched} matched, top {shown} shown with "
+            f"details re-checked live")
+    if gone:
+        line += f"; {gone} no longer exist and were left out"
+    if unverified:
+        line += (f"; details for {unverified} could not be re-checked just now and "
+                 f"may be slightly out of date")
+    if snap.total_count > indexed:
+        line += ("; the index does not cover every session, so tell the user "
+                 "results may be incomplete")
+    return line + "."
+
+
+def _search_sessions_impl(events: EventsClient, recorder: SessionRecorder,
+                          query: str, limit: int, catalog=None) -> str:
+    """Find sessions relevant to `query` and cap the results.
+
+    With a ready catalog index the WHOLE catalog is searched, results are ranked,
+    and the sessions shown are re-read live (see `_live_refresh`). Without one
+    (not built yet, or expired) it falls back to walking the first
+    MAX_LIST_PAGES pages of ListSessions and says so, since that covers only part
+    of the catalog.
     """
     limit = max(1, min(limit or config.DEFAULT_SESSION_RESULT_LIMIT,
                        config.MAX_SESSION_RESULT_LIMIT))
     terms = [t for t in _tokenize(query) if len(t) > 2]
 
+    snap = catalog.load_ready() if catalog is not None else None
+    if snap is not None:
+        ranked = _rank(snap.sessions, terms)
+        shown, gone, unverified = _live_refresh(events, ranked[:limit])
+        recorder.record("search_sessions", shown)
+        coverage = _index_coverage(snap, len(ranked), len(shown), gone, unverified)
+        if not shown:
+            return ("NO_RESULTS: no sessions matched. Suggest the user try a broader "
+                    "topic or a specific AWS service.\n" + coverage)
+        return _summarize_for_model(shown) + "\n" + coverage
+
     matches: list[Session] = []
     next_token = None
     pages = 0
+    scanned = 0
     while pages < config.MAX_LIST_PAGES:
         page, next_token = events.list_sessions(include_abstracts=False,
                                                 next_token=next_token)
         pages += 1
+        scanned += len(page)
         for s in page:
             if _relevant(s, terms):
                 matches.append(s)
@@ -281,11 +405,20 @@ def _search_sessions_impl(events: EventsClient, recorder: SessionRecorder,
         if len(matches) >= limit or not next_token:
             break
 
+    # The fallback reads only the first pages. If more remain, say so plainly.
+    coverage = ""
+    if next_token:
+        total = getattr(events, "last_total_count", None)
+        of = f" of {total}" if total else ""
+        coverage = (f"\nCOVERAGE: PARTIAL - only the first {scanned}{of} sessions were "
+                    f"searched because the full catalog index is not ready yet, so "
+                    f"results may be incomplete. Tell the user this briefly.")
+
     recorder.record("search_sessions", matches[:limit])
     if not matches:
         return ("NO_RESULTS: no sessions matched. Suggest the user try a broader "
-                "topic or a specific AWS service.")
-    return _summarize_for_model(matches[:limit])
+                "topic or a specific AWS service." + coverage)
+    return _summarize_for_model(matches[:limit]) + coverage
 
 
 def _get_details_impl(events: EventsClient, recorder: SessionRecorder,
@@ -322,13 +455,20 @@ def _unfavorite_impl(events: EventsClient, recorder: SessionRecorder,
     return "UNFAVORITE_FAILED: the unfavorite operation did not succeed."
 
 
-def _show_favorites_impl(events: EventsClient, recorder: SessionRecorder) -> str:
-    sessions, total = fav.get_favorites_with_total(events)
+def _show_favorites_impl(events: EventsClient, recorder: SessionRecorder,
+                         catalog=None) -> str:
+    stats: dict = {}
+    sessions, total = fav.get_favorites_with_total(events, catalog=catalog, stats=stats)
     recorder.record("show_favorites", sessions)
     if total == 0:
         return "NO_FAVORITES: the user has no favorite sessions yet."
     shown = len(sessions)
     summary = _summarize_for_model(sessions)
+    if stats.get("indexed"):
+        summary += (f"\nSOURCE: details for {stats['indexed']} of these come from the "
+                    f"catalog index (built {stats['age_text']} ago), not a live "
+                    f"re-check. Mention this only if the user asks how current "
+                    f"the details are.")
     # Honesty guard (Property 8 / no fabrication): the id count from GetSchedule
     # is the TRUE total. Detail resolution is bounded, so when fewer sessions
     # were resolved than the user actually has, say so explicitly instead of
@@ -407,7 +547,7 @@ def _index_lookup(want: str) -> list[Session]:
             if code.startswith(want + "-") and ts >= cutoff]
 
 
-def _lookup_sessions_by_code(events: EventsClient, code: str
+def _lookup_sessions_by_code(events: EventsClient, code: str, catalog=None
                              ) -> tuple[list[Session], bool]:
     """Find the session(s) whose code is `code`, walking the catalog if needed.
 
@@ -419,6 +559,18 @@ def _lookup_sessions_by_code(events: EventsClient, code: str
     want = _norm_code(code)
     if not want:
         return [], True
+
+    # A ready catalog index covers every session, so it answers definitively
+    # (found, or really absent) with no page walk at all.
+    snap = catalog.load_ready() if catalog is not None else None
+    if snap is not None:
+        exact = [s for s in snap.sessions if _norm_code(s.abbreviation) == want]
+        variants = [s for s in snap.sessions
+                    if _norm_code(s.abbreviation).startswith(want + "-")]
+        # Absent only counts as definitive if the index covers the whole catalog.
+        return (exact or variants), (bool(exact or variants) or
+                                     snap.total_count <= len(snap.sessions))
+
     cached = _index_lookup(want)
     if cached:
         return cached, True
@@ -484,36 +636,27 @@ def _walk_is_fresh() -> bool:
 
 
 def _walk_pages(events, on_page, next_token):
-    """Walk ListSessions pages, returning ``(pages_read, next_token, stopped)``
-    with `stopped` in found/end/cap/budget. Uses the client's single-connection
-    walk when available (much cheaper: one handshake for all pages); otherwise
-    falls back to one ``list_sessions`` call per page."""
-    walker = getattr(events, "walk_session_pages", None)
-    if walker is not None:
-        return walker(on_page,
-                      max_pages=config.MAX_CODE_LOOKUP_PAGES,
-                      budget_seconds=config.CODE_LOOKUP_BUDGET_SECONDS,
-                      next_token=next_token)
-    deadline = time.monotonic() + config.CODE_LOOKUP_BUDGET_SECONDS
-    pages = 0
-    while True:
-        page, next_token = events.list_sessions(include_abstracts=False,
-                                                next_token=next_token)
-        pages += 1
-        if on_page(page):
-            return pages, next_token, "found"
-        if not next_token:
-            return pages, None, "end"
-        if pages >= config.MAX_CODE_LOOKUP_PAGES:
-            return pages, next_token, "cap"
-        if time.monotonic() > deadline:
-            return pages, next_token, "budget"
+    """Walk ListSessions pages for a code lookup, returning
+    ``(pages_read, next_token, stopped)`` with `stopped` in found/end/cap/budget.
+    Uses the client's single-connection walk when available (much cheaper: one
+    handshake for all pages), else one ``list_sessions`` call per page."""
+    return catalog_cache.walk_pages(
+        events, on_page, next_token,
+        max_pages=config.MAX_CODE_LOOKUP_PAGES,
+        budget_seconds=config.CODE_LOOKUP_BUDGET_SECONDS)
 
 
 def _find_by_code_impl(events: EventsClient, recorder: SessionRecorder,
-                       code: str) -> str:
-    matches, searched_all = _lookup_sessions_by_code(events, code)
+                       code: str, catalog=None) -> str:
+    snap = catalog.load_ready() if catalog is not None else None
+    matches, searched_all = _lookup_sessions_by_code(events, code, catalog=catalog)
     shown = matches[:config.DEFAULT_SESSION_RESULT_LIMIT]
+    if snap is not None and shown:
+        # Matches came from the index: re-read them live so what is shown
+        # (room, time, availability) is current, not as of when it was indexed.
+        shown, gone, _unverified = _live_refresh(events, shown)
+        if not shown and gone:
+            matches, searched_all = [], True
     recorder.record("find_session_by_code", shown)
     if shown:
         extra = ""
@@ -611,9 +754,10 @@ def _cancel_reservation_impl(events: EventsClient, recorder: SessionRecorder,
 
 
 def _show_schedule_impl(events: EventsClient, recorder: SessionRecorder,
-                        date: str = None) -> str:
+                        date: str = None, catalog=None) -> str:
     try:
-        view = sched.build_schedule_view(events)
+        view = sched.build_schedule_view(
+            events, time_budget=config.CHAT_SCHEDULE_BUDGET_SECONDS, catalog=catalog)
     except McpAuthExpired:
         # Expired token for the whole fan-out. Fail fast with a controlled
         # signal rather than letting ~67 calls stall toward the 29s wall. The
@@ -653,6 +797,11 @@ def _show_schedule_impl(events: EventsClient, recorder: SessionRecorder,
                  else " and that only part of the list is shown")
         partial = (" PARTIAL (" + "; ".join(notes) + ") - tell the user some "
                    "sessions could not be loaded" + scope + ".")
+    if view.indexed.get("favorites"):
+        age = catalog_cache.format_age(view.indexed.get("ageSeconds", 0))
+        partial += (f" Favorite details come from the catalog index (built {age} "
+                    f"ago); reserved sessions were re-checked live. Mention this "
+                    f"only if the user asks how current the details are.")
     header = ("SCHEDULE{}: {} reserved session(s), {} favorite(s), {} personal-time "
               "block(s).{} Reserved seats, favorites, and personal time are distinct "
               "kinds.").format(day_label, n_reserved, n_fav, n_personal, partial)
@@ -678,13 +827,14 @@ def _show_schedule_impl(events: EventsClient, recorder: SessionRecorder,
 
 
 def _find_conflicts_impl(events: EventsClient, recorder: SessionRecorder,
-                         date: str = None) -> str:
+                         date: str = None, catalog=None) -> str:
     """Compute overlapping schedule items SERVER-SIDE and return a compact,
     authoritative list of conflicting pairs for the model to relay. The model
     does not infer overlaps from a transcribed list (which risked fabrication);
     it just reports what this returns."""
     try:
-        view = sched.build_schedule_view(events)
+        view = sched.build_schedule_view(
+            events, time_budget=config.CHAT_SCHEDULE_BUDGET_SECONDS, catalog=catalog)
     except McpAuthExpired:
         raise
     day_label = ""
@@ -848,7 +998,7 @@ def _session_matches_filters(session: Session, filters: dict) -> bool:
 
 def _count_sessions_impl(events: EventsClient, recorder: SessionRecorder,
                          scope: str = "favorites", group_by: str = None,
-                         filters: dict = None) -> str:
+                         filters: dict = None, catalog=None) -> str:
     """Count sessions in the user's FAVORITES (fast), their RESERVED sessions
     (fast), or the full CATALOG (slow; pages through everything). Optionally
     filter and/or group_by a dimension.
@@ -872,7 +1022,8 @@ def _count_sessions_impl(events: EventsClient, recorder: SessionRecorder,
             fav_ids = fav.get_favorite_ids(events)
             recorder.record("count_sessions", [])
             return f"COUNT: {len(fav_ids)} session(s) in your favorites."
-        sessions = fav.get_favorites(events, max_details=config.MAX_FAVORITE_DETAILS)
+        sessions = fav.get_favorites(events, max_details=config.MAX_FAVORITE_DETAILS,
+                                     catalog=catalog)
         scope_label = "your favorites"
     elif scope == "reserved":
         # Mirrors the favorites fast-path: a plain total needs only the reserved
@@ -885,17 +1036,25 @@ def _count_sessions_impl(events: EventsClient, recorder: SessionRecorder,
         sessions = resv.get_reserved_sessions(events, max_details=config.MAX_FAVORITE_DETAILS)
         scope_label = "your reserved sessions"
     else:
-        sessions = []
-        next_token = None
-        pages = 0
-        while pages < config.MAX_COUNT_PAGES:
-            page, next_token = events.list_sessions(include_abstracts=False,
-                                                    next_token=next_token)
-            pages += 1
-            sessions.extend(page)
-            if not next_token:
-                break
-        scope_label = "the re:Invent 2026 catalog"
+        snap = catalog.load_ready() if catalog is not None else None
+        if snap is not None:
+            # Whole catalog from the index: instant, but as of when it was built
+            # (counts are aggregates, so they are not re-read session by session).
+            sessions = list(snap.sessions)
+            scope_label = (f"the re:Invent 2026 catalog (index built {snap.age_text} "
+                           f"ago, {len(snap.sessions)} sessions)")
+        else:
+            sessions = []
+            next_token = None
+            pages = 0
+            while pages < config.MAX_COUNT_PAGES:
+                page, next_token = events.list_sessions(include_abstracts=False,
+                                                        next_token=next_token)
+                pages += 1
+                sessions.extend(page)
+                if not next_token:
+                    break
+            scope_label = "the re:Invent 2026 catalog"
 
     # Apply filters.
     filtered = [s for s in sessions if _session_matches_filters(s, filters)]
@@ -998,7 +1157,7 @@ def _summarize_one_for_model(s: Session) -> str:
 
 def build_agent(events: EventsClient, recorder: SessionRecorder,
                 default_limit: Optional[int] = None,
-                resolve_reference=None, history=None):
+                resolve_reference=None, history=None, catalog=None):
     """Create the Strands Agent with Bedrock + the two discovery tools.
 
     Imported lazily so unit tests can exercise the tool implementations and
@@ -1013,7 +1172,7 @@ def build_agent(events: EventsClient, recorder: SessionRecorder,
     def search_sessions(query: str) -> str:
         """Search AWS re:Invent 2026 sessions by topic, AWS service, level,
         session type, or day. Returns a numbered list of matching sessions."""
-        return _search_sessions_impl(events, recorder, query, limit)
+        return _search_sessions_impl(events, recorder, query, limit, catalog=catalog)
 
     @tool
     def get_session_details(reference: str) -> str:
@@ -1038,7 +1197,7 @@ def build_agent(events: EventsClient, recorder: SessionRecorder,
     @tool
     def show_favorites() -> str:
         """List the user's current favorite sessions from AWS Events."""
-        return _show_favorites_impl(events, recorder)
+        return _show_favorites_impl(events, recorder, catalog=catalog)
 
     @tool
     def find_session_by_code(code: str) -> str:
@@ -1047,7 +1206,7 @@ def build_agent(events: EventsClient, recorder: SessionRecorder,
         the WHOLE catalog, so use it whenever the user names a specific session
         code that was not in a list you already showed. Reports NOT_FOUND only
         after the whole catalog was checked."""
-        return _find_by_code_impl(events, recorder, code)
+        return _find_by_code_impl(events, recorder, code, catalog=catalog)
 
     @tool
     def show_schedule(date: str = None) -> str:
@@ -1062,7 +1221,7 @@ def build_agent(events: EventsClient, recorder: SessionRecorder,
         must not invent them). Write a one-sentence summary of the counts and,
         if helpful, offer to check conflicts. To find time clashes, call
         find_schedule_conflicts -- never guess overlaps yourself."""
-        return _show_schedule_impl(events, recorder, date=date)
+        return _show_schedule_impl(events, recorder, date=date, catalog=catalog)
 
     @tool
     def find_schedule_conflicts(date: str = None) -> str:
@@ -1072,7 +1231,7 @@ def build_agent(events: EventsClient, recorder: SessionRecorder,
         yourself. Pass `date` ('YYYY-MM-DD', 2026-11-30..2026-12-04) to check a
         single day, or omit it to check the whole schedule. Use this whenever
         the user asks about conflicts/overlaps/double-booking."""
-        return _find_conflicts_impl(events, recorder, date=date)
+        return _find_conflicts_impl(events, recorder, date=date, catalog=catalog)
 
     @tool
     def add_personal_time(title: str, start: str, end: str,
@@ -1149,7 +1308,8 @@ def build_agent(events: EventsClient, recorder: SessionRecorder,
                    "type": session_type}
         filters = {k: v for k, v in filters.items() if v}
         return _count_sessions_impl(events, recorder, scope=scope,
-                                    group_by=group_by, filters=filters)
+                                    group_by=group_by, filters=filters,
+                                    catalog=catalog)
 
     @tool
     def reserve_session(reference: str) -> str:
@@ -1187,7 +1347,8 @@ def build_agent(events: EventsClient, recorder: SessionRecorder,
         # reserve would be sent the CODE as if it were a sessionId.
         if _looks_like_code(reference):
             try:
-                found, _ = _lookup_sessions_by_code(events, reference)
+                found, _ = _lookup_sessions_by_code(events, reference,
+                                                    catalog=catalog)
             except (McpError, McpTimeoutError, McpUnavailableError):
                 found = []
             if found:
@@ -1229,9 +1390,15 @@ def run_agent_turn(agent, message: str, request_id: Optional[str] = None) -> str
         result = agent(message)
         return _extract_text(result)
 
+    # Not `with ThreadPoolExecutor(...)`: leaving that block waits for the worker
+    # to finish even after the timeout fired, so a stuck turn ran to Lambda's 29 s
+    # kill (an HTTP 500) instead of returning the controlled timeout below.
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        try:
             return ex.submit(run).result(timeout=config.AGENT_TURN_TIMEOUT)
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
     except concurrent.futures.TimeoutError:
         raise McpTimeoutError("agent turn exceeded time budget") from None
 

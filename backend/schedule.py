@@ -215,6 +215,7 @@ def _resolve_sessions(events, ids: list[str], max_details: Optional[int] = None,
     # auth failure and re-raise after the pool unwinds, letting the caller do
     # its single bounded refresh+retry (or surface "please reconnect").
     auth_expired: list[McpAuthExpired] = []
+    errors: dict = {}          # error type -> count, for the fetch summary log
 
     def fetch(sid: str):
         try:
@@ -222,10 +223,12 @@ def _resolve_sessions(events, ids: list[str], max_details: Optional[int] = None,
         except McpAuthExpired as exc:
             auth_expired.append(exc)
             return sid, None
-        except (McpError, McpTimeoutError, McpUnavailableError):
+        except (McpError, McpTimeoutError, McpUnavailableError) as exc:
+            errors[type(exc).__name__] = errors.get(type(exc).__name__, 0) + 1
             return sid, None
 
     by_id: dict[str, Session] = {}
+    done = 0
     workers = min(config.SCHEDULE_FETCH_WORKERS, len(ids))
     if deadline is None:
         deadline = config.SCHEDULE_FETCH_DEADLINE
@@ -235,6 +238,7 @@ def _resolve_sessions(events, ids: list[str], max_details: Optional[int] = None,
         try:
             for fut in concurrent.futures.as_completed(futures, timeout=deadline):
                 sid, sess = fut.result()
+                done += 1
                 if sess:
                     by_id[sid] = sess
         except concurrent.futures.TimeoutError:
@@ -245,6 +249,11 @@ def _resolve_sessions(events, ids: list[str], max_details: Optional[int] = None,
     finally:
         # Don't block shutdown on slow stragglers (py>=3.9 supports cancel_futures).
         ex.shutdown(wait=False, cancel_futures=True)
+    # These failures are swallowed per session by design, so record a summary:
+    # how many were asked for, came back, were still running at the deadline, and
+    # which error types occurred (throttling and timeouts show up here).
+    log_fetch_summary("schedule/detail_fetch", len(ids), len(by_id),
+                      len(ids) - done, errors)
     if auth_expired:
         # Token is expired for the whole fan-out -> surface it so the caller
         # refreshes once and retries, instead of returning a silently-empty
@@ -359,6 +368,7 @@ def filter_view_to_date(view: ScheduleView, pacific_date: str) -> ScheduleView:
         # Keep the completeness marker: if some sessions could not be loaded,
         # this day may be missing items, and the UI/agent should say so.
         incomplete=dict(view.incomplete),
+        indexed=dict(view.indexed),
     )
 
 
@@ -442,8 +452,15 @@ def find_conflicts(view: ScheduleView) -> list[dict]:
     return conflicts
 
 
-def build_schedule_view(events, max_details: Optional[int] = None) -> ScheduleView:
+def build_schedule_view(events, max_details: Optional[int] = None,
+                        time_budget: Optional[float] = None,
+                        catalog=None) -> ScheduleView:
     """Build an ordered ScheduleView from the owner's GetSchedule result.
+
+    ``time_budget`` (seconds, default ``SCHEDULE_REQUEST_BUDGET_SECONDS``) is the
+    time this whole call may take. Whatever ``GetSchedule`` uses comes off what
+    the GetSession detail fetch may spend, so a slow ``GetSchedule`` can no longer
+    push the request past Lambda's 29 s limit (which killed it with a 500).
 
     Resolves reserved + favorite sessionIds to full Session details via a
     bounded-concurrency GetSession fan-out (reusing the favorites pattern,
@@ -453,6 +470,9 @@ def build_schedule_view(events, max_details: Optional[int] = None) -> ScheduleVi
     derives solely from AWS Events state; nothing is cached or fabricated
     (Req 17.1, 17.3, 17.7, 22.1, 22.2).
     """
+    total_budget = float(config.SCHEDULE_REQUEST_BUDGET_SECONDS
+                         if time_budget is None else time_budget)
+    began = time.monotonic()
     schedule = events.get_schedule()
     if not isinstance(schedule, dict):
         return ScheduleView()
@@ -479,13 +499,38 @@ def build_schedule_view(events, max_details: Optional[int] = None) -> ScheduleVi
     # The two fan-outs share ONE time budget. Run back to back with a budget
     # each, they could add up to twice SCHEDULE_FETCH_DEADLINE and overrun the
     # Lambda timeout; sharing keeps the whole detail fetch within one deadline.
-    budget = float(config.SCHEDULE_FETCH_DEADLINE)
+    # The detail fetch gets at most SCHEDULE_FETCH_DEADLINE, and never more than
+    # what is left of the whole-request budget after GetSchedule (keeping a
+    # second of margin to build and return the response).
+    left = total_budget - (time.monotonic() - began) - 1.0
+    budget = max(1.0, min(float(config.SCHEDULE_FETCH_DEADLINE), left))
     started = time.monotonic()
+
+    # RESERVED sessions are real commitments, so their details are always read
+    # live. FAVORITES take their details from the catalog index when it is ready
+    # (no AWS Events calls); only favorites missing from it are read live. That
+    # is what keeps a long favorites list from needing ~70 parallel connections.
+    snap = None
+    if catalog is not None and config.FAVORITE_DETAILS_FROM_INDEX:
+        snap = catalog.load_ready()
+    index_by_id = {s.session_id: s for s in snap.sessions} if snap is not None else {}
+    favorite_ids_capped = favorite_ids[:max_details if max_details is not None
+                                       else config.MAX_SCHEDULE_DETAILS]
+    from_index = {sid: index_by_id[sid] for sid in favorite_ids_capped if sid in index_by_id}
+    favorites_live_ids = [sid for sid in favorite_ids_capped if sid not in from_index]
+
     reserved = _resolve_sessions(events, reserved_ids, max_details=max_details,
                                  deadline=budget)
     remaining = max(1.0, budget - (time.monotonic() - started))
-    favorites = _resolve_sessions(events, favorite_ids, max_details=max_details,
-                                  deadline=remaining)
+    live_favorites = _resolve_sessions(events, favorites_live_ids,
+                                       max_details=max_details, deadline=remaining)
+    found = dict(from_index)
+    found.update({s.session_id: s for s in live_favorites})
+    favorites = [found[sid] for sid in favorite_ids_capped if sid in found]
+
+    indexed: dict = {}
+    if from_index:
+        indexed = {"favorites": len(from_index), "ageSeconds": snap.age_seconds}
 
     personal_time = [
         PersonalTimeEntry.from_mcp(item)
@@ -507,6 +552,7 @@ def build_schedule_view(events, max_details: Optional[int] = None) -> ScheduleVi
         favorites=_order(favorites, _session_bounds),
         personal_time=_order(personal_time, _personal_bounds),
         incomplete=incomplete,
+        indexed=indexed,
     )
 
 
@@ -545,7 +591,7 @@ from errors import (
     ValidationError,
 )
 from mcp_client import EventsClient, McpAuthExpired
-from logging_utils import log_event
+from logging_utils import log_event, log_fetch_summary
 
 
 def _log_pt_failure(op: str, exc: Exception, personal_time_id: str = None) -> None:

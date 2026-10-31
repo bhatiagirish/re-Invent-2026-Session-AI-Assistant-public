@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import Optional
 
 import logging
+import os
 
 from errors import McpError
 from favorites import (_failed_ids, _failure_reason, extract_session_ids,
@@ -83,21 +84,21 @@ def reserve_session(events: EventsClient, session_id: str,
     resp = _unwrap_result(raw)
     succeeded = _succeeded_ids(resp)
     failed = _failed_ids(resp)
-    try:
-        import json as _json
-        # TEMP DIAGNOSTIC: log the FULL raw response so we can read the exact
-        # ReserveSessions schema (bucket + field names) in CloudWatch. This is
-        # the owner's own reservation data (no credentials/tokens), and the line
-        # is removed once the schema is confirmed and _succeeded_ids/_failed_ids
-        # are pinned to the real keys.
-        _log.info("reserve_sessions RAW_RESPONSE for %s: raw=%s unwrapped=%s",
-                  session_id,
-                  _json.dumps(raw, default=str)[:1500] if isinstance(raw, dict) else repr(raw)[:1500],
-                  _json.dumps(resp, default=str)[:1500] if isinstance(resp, dict) else repr(resp)[:1500])
-        _log.info("reserve_sessions parsed: in_succeeded=%s in_failed=%s",
-                  session_id in succeeded, session_id in failed)
-    except Exception:
-        pass
+    # Troubleshooting only: with MCP_DEBUG on, log the raw ReserveSessions
+    # response (the owner's reservation data, no credentials). Off by default:
+    # the response schema is confirmed and pinned in _succeeded_ids/_failed_ids,
+    # so routine reserves no longer write reservation details to CloudWatch.
+    if os.environ.get("MCP_DEBUG", "").lower() in ("1", "true", "yes"):
+        try:
+            import json as _json
+            _log.info("reserve_sessions RAW_RESPONSE for %s: raw=%s unwrapped=%s",
+                      session_id,
+                      _json.dumps(raw, default=str)[:1500] if isinstance(raw, dict) else repr(raw)[:1500],
+                      _json.dumps(resp, default=str)[:1500] if isinstance(resp, dict) else repr(resp)[:1500])
+            _log.info("reserve_sessions parsed: in_succeeded=%s in_failed=%s",
+                      session_id in succeeded, session_id in failed)
+        except Exception:
+            pass
 
     # TRUTHFUL success requires POSITIVE confirmation: the id must appear in the
     # succeeded bucket. We do NOT infer success from mere absence from failed[]

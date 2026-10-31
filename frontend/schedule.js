@@ -288,6 +288,32 @@
     return div;
   }
 
+  // "Favorite details as of 12 min ago" when the backend took favorites'
+  // details from its catalog index (fast) rather than re-reading each one live.
+  // Reserved sessions are always re-read live, so they are never mentioned here.
+  function describeIndexed(indexed) {
+    if (!indexed || typeof indexed !== "object" || !indexed.favorites) return "";
+    var secs = Math.max(0, Number(indexed.ageSeconds) || 0);
+    var mins = Math.floor(secs / 60);
+    var age = mins < 1 ? "under a minute"
+      : mins < 60 ? mins + " min"
+      : Math.floor(mins / 60) + " h" + (mins % 60 ? " " + (mins % 60) + " min" : "");
+    return "Favorite details as of " + age + " ago. Reserved sessions are re-checked live.";
+  }
+
+  // Add a "Try again" button to an error block when the caller supplied
+  // `opts.onRetry` (the schedule dialog does), so a transient failure does not
+  // force the user to close and reopen the dialog.
+  function addRetry(block, opts) {
+    if (!opts || typeof opts.onRetry !== "function") return;
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn btn-secondary schedule-retry";
+    btn.textContent = "Try again";
+    btn.addEventListener("click", function () { opts.onRetry(); });
+    block.appendChild(btn);
+  }
+
   // Turn the backend's `incomplete` marker ({kind: {loaded, total}}) into a
   // sentence, or "" when everything loaded.
   function describeIncomplete(incomplete) {
@@ -322,11 +348,13 @@
     // shown (Req 17.6, 22.4, 23.3).
     var degraded = data && typeof data.message === "string" && data.message;
     if (opts.error || degraded) {
-      wrap.appendChild(messageBlock(
+      var errBlock = messageBlock(
         "schedule-error",
         "Your schedule couldn't be retrieved.",
         opts.message || degraded || "Please try again."
-      ));
+      );
+      addRetry(errBlock, opts);
+      wrap.appendChild(errBlock);
       return wrap;
     }
 
@@ -350,11 +378,13 @@
     // Empty-schedule state (Req 17.5, 23.3): no rows at all.
     if (!reserved.length && !favorites.length && !personal.length) {
       if (incompleteText) {
-        wrap.appendChild(messageBlock(
+        var partialBlock = messageBlock(
           "schedule-error",
           "Your schedule couldn't be fully loaded.",
           incompleteText
-        ));
+        );
+        addRetry(partialBlock, opts);
+        wrap.appendChild(partialBlock);
         return wrap;
       }
       wrap.appendChild(messageBlock(
@@ -371,6 +401,14 @@
       note.setAttribute("role", "status");
       note.textContent = incompleteText;
       wrap.appendChild(note);
+    }
+
+    var indexedText = describeIndexed(data.indexed);
+    if (indexedText) {
+      var src = document.createElement("p");
+      src.className = "schedule-source";
+      src.textContent = indexedText;
+      wrap.appendChild(src);
     }
 
     // Tag each item with exactly one kind, then merge + order chronologically.

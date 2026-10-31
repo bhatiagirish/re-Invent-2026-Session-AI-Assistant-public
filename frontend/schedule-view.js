@@ -70,23 +70,110 @@
 
   // Fetch GET /schedule and render it. On any failure render the error state via
   // renderScheduleView({error:true,...}) so no partial/cached view is shown.
-  async function refresh() {
+  function delay(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  // While the catalog index is still being built (about a minute after a
+  // deploy, or after a long absence), favorites have no fast source for their
+  // details, so loading now would take the slow per-session path that tends to
+  // fail. Wait for the index instead (at most INDEX_WAIT_MS), saying why. If it
+  // is not ready by then, load anyway: the slow path still works, just slowly.
+  const INDEX_WAIT_MS = 45000;
+
+  function showPreparing() {
+    const e = els();
+    if (!e.content) return;
+    const div = document.createElement("div");
+    div.className = "schedule-state schedule-loading schedule-preparing";
+    div.setAttribute("role", "status");
+    div.innerHTML =
+      '<p class="schedule-state-title">Preparing your schedule…</p>' +
+      '<p class="schedule-state-body">Getting the session index ready so your full ' +
+      "schedule loads quickly. This can take about a minute.</p>";
+    renderInto(div);
+  }
+
+  // Opening the dialog right after page load usually catches the first index
+  // check still in flight. That is not a build (the index normally exists), so
+  // show the ordinary "Loading" text and wait briefly for the answer; only if
+  // the backend then says a build is under way, show "Preparing" and wait for it.
+  const INDEX_CHECK_WAIT_MS = 10000;
+
+  async function waitForIndex() {
+    const C = window.Catalog;
+    if (!C || typeof C.isBuilding !== "function" || typeof C.whenReady !== "function") {
+      return;
+    }
+    const checking = () => typeof C.isChecking === "function" && C.isChecking();
+    if (checking() && typeof C.whenKnown === "function") {
+      showLoading();
+      await C.whenKnown(INDEX_CHECK_WAIT_MS);
+    }
+    // Still no answer after the check window: a ready index answers within a
+    // second or two, so a missing answer means a build step is running. Keep
+    // waiting for it rather than falling back to the slow path (which is what
+    // produced "Showing 47 of 70 favorites" right after a fresh deploy).
+    if (!C.isBuilding() && !checking()) return;
+    showPreparing();
+    await C.whenReady(INDEX_WAIT_MS);
+  }
+  // Pauses before the 1st and 2nd automatic retry. A brief AWS Events hiccup or
+  // throttle usually clears within a few seconds, so the pauses lengthen.
+  const RETRY_DELAYS_MS = [2000, 4000];
+  // A failure that took this long (a timeout) is not retried automatically: it
+  // already cost most of a minute, and repeating it would only keep the user
+  // staring at a spinner. The error box's "Try again" button covers that case.
+  const SLOW_FAILURE_MS = 8000;
+
+  // Load the schedule. A failed load is retried automatically (up to twice)
+  // when it failed QUICKLY. An expired session (AUTH_REQUIRED) is never retried:
+  // it cannot succeed until the user reconnects. Whatever still fails shows an
+  // error with a "Try again" button.
+  // `opts.skipIndexWait`: used by the refresh that follows adding, editing or
+  // deleting personal time, so the form never sits on "Preparing" for up to
+  // 45 s right after a save. Opening the dialog and "Try again" do wait.
+  async function refresh(opts) {
     if (!window.Schedule || typeof window.Schedule.renderScheduleView !== "function") {
       return;
     }
+    if (!(opts && opts.skipIndexWait)) await waitForIndex();
     showLoading();
-    try {
-      const { data } = await window.API.getSchedule();
-      renderInto(window.Schedule.renderScheduleView(data || {}, {}));
-    } catch (err) {
-      if (err && err.category === "AUTH_REQUIRED" && window.Auth) {
-        window.Auth.checkAuthStatus();
+    let lastErr = null;
+    let lastData = null;       // a backend "couldn't retrieve" response (HTTP 200)
+    for (let attempt = 0; ; attempt++) {
+      const startedAt = Date.now();
+      lastErr = null;
+      lastData = null;
+      try {
+        const { data } = await window.API.getSchedule();
+        const degraded = data && typeof data.message === "string" && data.message;
+        if (!degraded) {
+          renderInto(window.Schedule.renderScheduleView(data || {}, { onRetry: refresh }));
+          return;
+        }
+        lastData = data;
+      } catch (err) {
+        lastErr = err;
+        if (err && err.category === "AUTH_REQUIRED") break;
       }
-      const message = (err && err.category === "NETWORK")
-        ? "Unable to reach the Session Assistant. Please check your connection."
-        : "Please try again.";
-      renderInto(window.Schedule.renderScheduleView(null, { error: true, message }));
+      const quick = Date.now() - startedAt < SLOW_FAILURE_MS;
+      if (!quick || attempt >= RETRY_DELAYS_MS.length) break;
+      await delay(RETRY_DELAYS_MS[attempt]);
     }
+    if (lastData) {
+      // Show the backend's own message, with a Try again button.
+      renderInto(window.Schedule.renderScheduleView(lastData, { onRetry: refresh }));
+      return;
+    }
+    if (lastErr && lastErr.category === "AUTH_REQUIRED" && window.Auth) {
+      window.Auth.checkAuthStatus();
+    }
+    const message = (lastErr && lastErr.category === "NETWORK")
+      ? "Unable to reach the Session Assistant. Please check your connection."
+      : "Please try again.";
+    renderInto(window.Schedule.renderScheduleView(null,
+      { error: true, message, onRetry: refresh }));
   }
 
   // Open the Schedule_View. Guarded by authorization so it never surfaces MCP
@@ -109,14 +196,14 @@
   async function createPersonalTime(entry) {
     const { data } = await window.API.createPersonalTime(entry);
     const action = data && data.action;
-    if (action && action.status === "success") await refresh();
+    if (action && action.status === "success") await refresh({ skipIndexWait: true });
     return action || { status: "failed" };
   }
 
   async function updatePersonalTime(personalTimeId, entry) {
     const { data } = await window.API.updatePersonalTime(personalTimeId, entry);
     const action = data && data.action;
-    if (action && action.status === "success") await refresh();
+    if (action && action.status === "success") await refresh({ skipIndexWait: true });
     return action || { status: "failed" };
   }
 
@@ -136,7 +223,7 @@
       // so both views stay consistent.
       if (card && typeof card.remove === "function") card.remove();
       const e = els();
-      if (e.backdrop && !e.backdrop.hidden) await refresh();
+      if (e.backdrop && !e.backdrop.hidden) await refresh({ skipIndexWait: true });
       if (window.Chat) window.Chat.notify("Personal time block deleted.");
     } else {
       if (window.Chat) window.Chat.notify(

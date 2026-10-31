@@ -726,6 +726,12 @@
       return reply({ action: { type: "delete", status: "success", personalTimeId: id } });
     },
 
+    // The demo searches its own small sample set directly, so there is no
+    // catalog index to build; report "ready" so the page stops asking.
+    warmCatalog: function () {
+      return reply({ enabled: true, ready: true, building: false,
+                     sessions: D.sessions.length, totalCount: D.sessions.length }, 200, 20, 60);
+    },
     getReservations: function () {
       return reply({ sessions: idsToSessions(state.reserved).map(pub) });
     },

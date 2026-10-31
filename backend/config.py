@@ -83,7 +83,17 @@ AWS_REGION: str = os.environ.get("AWS_REGION", "us-east-1")
 
 # ── Timeouts (seconds) ────────────────────────────────────────────────────
 OAUTH_EXCHANGE_TIMEOUT: int = int(os.environ.get("OAUTH_EXCHANGE_TIMEOUT", "10"))
-MCP_CALL_TIMEOUT: int = int(os.environ.get("MCP_CALL_TIMEOUT", "20"))
+# Per-call ceiling for one AWS Events MCP call. A normal call takes 1-3 s, so 10 s
+# is generous. It must stay well under Lambda's 29 s limit: a call that hangs is
+# abandoned at this limit (the request then fails fast and can be retried)
+# instead of holding the whole request until Lambda kills it.
+MCP_CALL_TIMEOUT: int = int(os.environ.get("MCP_CALL_TIMEOUT", "10"))
+# Whole-request time budget for building the schedule view (GET /schedule):
+# GetSchedule plus the GetSession fan-out, retries included. Lambda stops at 29 s.
+SCHEDULE_REQUEST_BUDGET_SECONDS: int = int(os.environ.get("SCHEDULE_REQUEST_BUDGET_SECONDS", "24"))
+# The same, when the schedule is built inside a chat turn (the agent turn has a
+# 26 s budget that also pays for the model calls).
+CHAT_SCHEDULE_BUDGET_SECONDS: int = int(os.environ.get("CHAT_SCHEDULE_BUDGET_SECONDS", "16"))
 
 # ── Bedrock / Strands Agent (Phase 3) ─────────────────────────────────────
 BEDROCK_MODEL_ID: str = os.environ.get(
@@ -136,6 +146,58 @@ SCHEDULE_FETCH_WORKERS: int = int(os.environ.get("SCHEDULE_FETCH_WORKERS", "20")
 # this budget and skip stragglers -> a complete-as-possible schedule, never a
 # hang. Kept well under AGENT_TURN_TIMEOUT (26s).
 SCHEDULE_FETCH_DEADLINE: int = int(os.environ.get("SCHEDULE_FETCH_DEADLINE", "15"))
+
+# ── Catalog index cache (search over the WHOLE catalog) ───────────────────
+# ListSessions can only be paged (no filter), and each page is slow, so reading
+# the whole ~2,400-session catalog cannot fit inside one chat turn. A compact
+# INDEX of the catalog is therefore built in the background (POST /catalog/warm,
+# called by the page after load) and stored in DynamoDB. The index is used ONLY
+# to decide which sessions match a search/count; the sessions actually shown are
+# re-read live from AWS Events, so room/time/availability are never stale.
+# User state (favorites, reservations, schedule, personal time) is never cached.
+CATALOG_CACHE_ENABLED: bool = os.environ.get("CATALOG_CACHE_ENABLED", "true").lower() not in ("0", "false", "no")
+# After this long the catalog's session COUNT is re-checked against AWS Events
+# (one cheap call); if it changed, the index is rebuilt.
+CATALOG_RECHECK_SECONDS: int = int(os.environ.get("CATALOG_RECHECK_SECONDS", "900"))
+# SOFT limit: once the index is this old, the next warm call rebuilds it in the
+# background WHILE the old index keeps serving searches, then switches over when
+# the new one is complete, so there is no gap of partial searches. It is set to
+# about the length of a connection (the user's token lasts ~1 hour), because a
+# warm call only happens while a session is valid: this way every fresh
+# connection rebuilds an index that is over an hour old. That also bounds how
+# long a same-size swap of sessions (one added, one removed), which the
+# totalCount check cannot see, can go unnoticed. Keep it well below
+# CATALOG_MAX_AGE_SECONDS.
+CATALOG_REFRESH_SECONDS: int = int(os.environ.get("CATALOG_REFRESH_SECONDS", "3600"))
+# HARD limit: an index older than this is never used for searching. It only
+# matters when nobody kept the page open (nothing can rebuild without the user's
+# token, which lasts about an hour), so the index quietly expires.
+CATALOG_MAX_AGE_SECONDS: int = int(os.environ.get("CATALOG_MAX_AGE_SECONDS", "21600"))
+# Time budget (seconds) for one warm call; the build resumes across calls.
+CATALOG_WARM_BUDGET_SECONDS: int = int(os.environ.get("CATALOG_WARM_BUDGET_SECONDS", "15"))
+# The FIRST step of a brand-new build reads only this many pages, so the page
+# learns within a few seconds that a build is under way (a full step can take
+# ~15 s, during which the schedule dialog would not know whether to wait).
+# Later steps continue the build at full size. 0 disables the short first step.
+CATALOG_FIRST_STEP_PAGES: int = int(os.environ.get("CATALOG_FIRST_STEP_PAGES", "1"))
+# A partially built index older than this is abandoned and restarted.
+CATALOG_BUILD_MAX_AGE_SECONDS: int = int(os.environ.get("CATALOG_BUILD_MAX_AGE_SECONDS", "1800"))
+# Safety cap on pages read while building (catalog is ~10 pages of 250).
+CATALOG_MAX_PAGES: int = int(os.environ.get("CATALOG_MAX_PAGES", "40"))
+# DynamoDB items are limited to 400 KB; index chunks are split to stay under this.
+CATALOG_CHUNK_BYTES: int = int(os.environ.get("CATALOG_CHUNK_BYTES", "300000"))
+# Deadline (seconds) for re-reading the shown sessions live from AWS Events.
+CATALOG_LIVE_REFRESH_DEADLINE: float = float(os.environ.get("CATALOG_LIVE_REFRESH_DEADLINE", "8"))
+
+# Where FAVORITES get their session details (title, time, room, speakers) for
+# the schedule view and the favorites list. Reading ~70 of them live means ~70
+# fresh connections to AWS Events, which is slow and gets throttled (the schedule
+# took 16-20 s and showed "51 of 70"). With this on, favorites take their details
+# from the catalog index (one DynamoDB read, no AWS Events calls), the response
+# says how old that index is, and only favorites missing from the index are read
+# live. RESERVED sessions are always re-read live: they are real commitments.
+# Set to "false" to read everything live, as before.
+FAVORITE_DETAILS_FROM_INDEX: bool = os.environ.get("FAVORITE_DETAILS_FROM_INDEX", "true").lower() not in ("0", "false", "no")
 
 # ── Session-code lookup ───────────────────────────────────────────────────
 # ListSessions has no search/filter, only paging (250 per page, ~2400 sessions =
