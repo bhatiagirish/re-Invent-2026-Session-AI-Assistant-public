@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import logging
 import threading
 import time
 from typing import Callable, Optional
@@ -30,6 +31,8 @@ from errors import (
     McpUnavailableError,
 )
 from models import Session
+
+_log = logging.getLogger(__name__)
 
 
 class McpAuthExpired(Exception):
@@ -202,7 +205,9 @@ class EventsClient:
         self._listing_tried = True
         try:
             names = self.list_tools()
-        except Exception:
+        except Exception as exc:
+            _log.warning("list_tools failed; using default tool names: %s: %s",
+                         type(exc).__name__, exc)
             names = []
         self._tool_map = {_normalize(n): n for n in names}
         if self._tool_map:
@@ -703,15 +708,25 @@ def determine_registration(events: EventsClient) -> str:
     """
     from models import AuthState
 
-    try:
-        events.get_schedule()
-        return AuthState.AUTHORIZED.value
-    except EventAccessDeniedError:
-        return AuthState.NOT_REGISTERED.value
-    except McpAuthExpired:
-        # token problem, not a registration signal
-        return AuthState.ERROR.value
-    except (McpUnavailableError, McpTimeoutError, McpError):
-        return AuthState.ERROR.value
-    except Exception:
-        return AuthState.ERROR.value
+    # A cold container can fail the first probe (tool-name discovery fails, so a
+    # default name the server rejects is used). Retry once with discovery reset;
+    # definitive answers (authorized / denied / auth expired) are never retried.
+    started = time.monotonic()
+    for attempt in (1, 2):
+        try:
+            events.get_schedule()
+            return AuthState.AUTHORIZED.value
+        except EventAccessDeniedError:
+            return AuthState.NOT_REGISTERED.value
+        except McpAuthExpired:
+            # token problem, not a registration signal
+            return AuthState.ERROR.value
+        except Exception as exc:  # McpUnavailable/Timeout/McpError/anything else
+            _log.warning("registration probe attempt %d failed: %s: %s",
+                         attempt, type(exc).__name__, exc)
+            # Lambda stops at 29 s; skip the retry if attempt 1 used most of it.
+            if attempt == 2 or time.monotonic() - started > 16:
+                return AuthState.ERROR.value
+            events._tool_map = {}
+            events._listing_tried = False
+    return AuthState.ERROR.value
