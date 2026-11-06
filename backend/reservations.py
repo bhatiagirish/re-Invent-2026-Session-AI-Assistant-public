@@ -100,6 +100,14 @@ def reserve_session(events: EventsClient, session_id: str,
         except Exception:
             pass
 
+    # Always-on outcome log (one line, no credentials): records whether AWS
+    # Events put this id in the succeeded/failed bucket and the failure reason,
+    # so a reserve that returns HTTP 200 but did NOT confirm is diagnosable from
+    # CloudWatch without flipping MCP_DEBUG and redeploying.
+    _log.info("reserve outcome sessionId=%s code=%s in_succeeded=%s in_failed=%s reason=%r",
+              session_id, session_code, session_id in succeeded, session_id in failed,
+              (_failure_reason(resp, session_id) if session_id in failed else None))
+
     # TRUTHFUL success requires POSITIVE confirmation: the id must appear in the
     # succeeded bucket. We do NOT infer success from mere absence from failed[]
     # (that false-positived a "seats full" session that AWS reported as failed

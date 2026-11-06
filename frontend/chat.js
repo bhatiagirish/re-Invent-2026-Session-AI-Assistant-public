@@ -198,7 +198,9 @@
     banner.hidden = false;
     banner.classList.toggle("is-error", !!isError);
     clearTimeout(notify._t);
-    notify._t = setTimeout(() => { banner.hidden = true; }, 5000);
+    // Errors (e.g. "session full") linger longer so they aren't missed;
+    // success confirmations clear sooner.
+    notify._t = setTimeout(() => { banner.hidden = true; }, isError ? 10000 : 5000);
   }
 
   function setSending(on) {
@@ -378,6 +380,12 @@
     appendMessage("assistant", data.message && data.total > sessions.length
       ? data.message
       : "Here are your reserved sessions.");
+    // Every session in this view IS reserved, so seed the reserved-id set before
+    // rendering (mirrors loadFavorites -> setFavoriteIds). Without this the
+    // reserve buttons render as "Reserve a seat" instead of "✓ Reserved".
+    if (window.Reservations && typeof window.Reservations.setReservedIds === "function") {
+      window.Reservations.setReservedIds(sessions.map((s) => s.sessionId));
+    }
     const list = window.Sessions.renderSessionList(sessions);
     list.querySelectorAll(".session-card").forEach((c) => (c.dataset.view = "reserved"));
     el("conversation").appendChild(list);
